@@ -21,7 +21,8 @@ LOOP PROTOCOL (enforced externally — each call is one real round):
 
 GATE BEFORE TRY: Write exactly what the previous round failed on. No silent retries.
 TRY: Choose an approach genuinely different from all prior approaches. Systematically inspect the `approach_graph` of all previous failing rounds in `scores` to perform structural deduction. Identify which nodes, relations, and paths failed, and construct a new strategy that targets completely different components, files, or relationships (aiming for minimal structural intersection/overlap with prior failing graphs).
-TEST: You have access to bash_exec, file_read, and file_write tools. The host editor/runner will execute them.
+TEST: You have access to bash_exec, file_read, and file_write tools.
+  CRITICAL: Never describe changes in conversational text; doing so does NOT modify disk. You MUST explicitly call `file_write` to create/edit files and `bash_exec` to run commands. Text descriptions are non-operational.
 SCORE: Per-requirement pass/fail. Not holistic.
 GATE BEFORE COMMIT: Functional end-to-end verification required.
 
@@ -64,5 +65,42 @@ exit_ready: false
 deadlock: false
 ```
 """
+
+
+# ==============================================================================
+# JINX Prompt Templates & Construction Utilities
+# ==============================================================================
+
+MISSING_STATE_WARNING: str = (
+    "WARNING: You did not output the REQUIRED markdown YAML state block (```yaml ... ```) at the end of your last response!\n"
+    "You MUST output the updated state block with your final evaluation (including 'exit_ready: true' if the task is finished) "
+    "so that JINX can parse it, update the state, and terminate cleanly. Do not skip this block!\n\n"
+)
+
+TOOL_DEPTH_CRITICAL_MSG: str = (
+    "CRITICAL: The inner tool-calling depth limit has been reached. "
+    "Do not call any more tools. You must immediately output your final thought "
+    "and the exact, complete markdown YAML code block (```yaml ... ```) to persist your progress and avoid state loss."
+)
+
+
+def construct_round_prompt(
+    rnd: int, min_rounds: int, task: str, state_dump: str, missing_state: bool = False
+) -> str:
+    """Constructs the structured user prompt for a specific execution round in the cognitive loop.
+
+    Args:
+        rnd (int): The current execution round index.
+        min_rounds (int): The minimum configured round threshold.
+        task (str): The main task or objective description assigned to JINX.
+        state_dump (str): The serialized YAML or JSON string representing the current state block.
+        missing_state (bool): If True, prepends the missing state block warning message.
+
+    Returns:
+        str: The fully-formed, formatted user prompt string for the cognitive loop.
+    """
+    warning_prefix = MISSING_STATE_WARNING if missing_state else ""
+    return f"{warning_prefix}ROUND {rnd} of {min_rounds}+\nTASK: {task}\nCURRENT STATE:\n{state_dump}"
+
 
 

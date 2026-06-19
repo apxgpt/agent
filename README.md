@@ -2,7 +2,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/JINX-Enterprise_Agent_Runtime-0F172A?style=for-the-badge&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZmlsbD0id2hpdGUiIGQ9Ik0xMiAyTDIgN2wxMCA1IDEwLTV6TTIgMTdsOCA0IDgtNE0yIDEybDggNCA4LTQiLz48L3N2Zz4=" alt="JINX Badge" />
-  <img src="https://img.shields.io/badge/version-1.1.6--enterprise-2563EB?style=for-the-badge" alt="Version Badge" />
+  <img src="https://img.shields.io/badge/version-1.1.7--enterprise-2563EB?style=for-the-badge" alt="Version Badge" />
   <img src="https://img.shields.io/badge/architecture-Process_Isolated_IPC-0D9488?style=for-the-badge" alt="Architecture Badge" />
   <img src="https://img.shields.io/badge/integration-Subprocess_Standard_Streams-059669?style=for-the-badge" alt="Integration Badge" />
 </p>
@@ -544,4 +544,86 @@ The test suite can be run from the repository root:
   ```bash
   python scripts/jinx_test.py --stress
   ```
+
+---
+
+## 8. Integration Protocol for Anthropic Claude Code CLI Host Environment
+
+The JINX architectural specification defines seamless runtime deployment as a managed core within the official **Anthropic Claude Code CLI** console development environment. Under this orchestration scheme, Claude Code assumes the role of the parent orchestration host, translating JINX's logical steps into external services and the local file system.
+
+The orchestration host manages:
+1. Interception of incoming user requests.
+2. Routing requests to external inference gateways (Claude 3.5 Sonnet via Anthropic API).
+3. Executing JINX declarative directives for file read, write, and system command execution.
+4. Feeding results back into the JINX cognitive loop via the File-IPC mechanism.
+
+In this repository, `CLAUDE.md` is configured to automatically and unconditionally route all user messages, greetings, and tasks through JINX to ensure the automated orchestration loop works seamlessly. If you prefer to manually invoke JINX, you can edit `CLAUDE.md` to restrict it to explicit requests only.
+
+### Security and Interactive Execution Authorization
+
+By default, the Claude Code CLI security model requires interactive operator confirmation for each file modification and shell command execution. 
+
+> [!TIP]
+> **Recommended Secure Setup**: We strongly recommend keeping interactive prompts enabled. This ensures you explicitly review and approve every change JINX proposes before it is executed on your system.
+
+#### OPTIONAL: Non-Interactive Sandbox Mode (For isolated or trust-verified environments)
+
+If you prefer a fully automated, non-blocking cognitive loop (e.g., in a secure, isolated development container, sandboxed virtual machine, or CI/CD runner), you can opt to configure Claude's global settings to auto-approve file edits and specific shell patterns.
+
+> [!CAUTION]
+> **CRITICAL SECURITY WARNING**: Enabling `"defaultMode": "acceptEdits"` and auto-approving shell commands disables Claude Code's interactive confirmation prompts. This allows JINX (and any other agent running in this workspace) to read, write, and execute arbitrary commands on your host system without asking for confirmation. Do NOT configure these settings on your main host or in untrusted project environments.
+
+The global settings configuration file is located at the universal path mapped to the active user profile's home directory:
+* **Windows OS**: `%USERPROFILE%\.claude\settings.json` (resolves to `C:\Users\<Active_User_Account>\.claude\settings.json` dynamically)
+* **macOS / Linux**: `~/.claude/settings.json` (resolves to `/home/<username>/.claude/settings.json`)
+
+#### System Directives to Initialize or Modify the Configuration Profile:
+
+To initialize or edit the security profile under your active user context, execute the appropriate shell command:
+
+* **Windows (PowerShell)**:
+  ```powershell
+  notepad "$env:USERPROFILE\.claude\settings.json"
+  ```
+* **Windows (Command Prompt - CMD)**:
+  ```cmd
+  notepad %USERPROFILE%\.claude\settings.json
+  ```
+* **macOS / Linux (Terminal)**:
+  ```bash
+  nano ~/.claude/settings.json
+  ```
+
+Insert the following declarative permissions block into the JSON configuration file (wrap in a root `{}` object if the file is being newly created):
+
+```json
+{
+  "permissions": {
+    "defaultMode": "acceptEdits",
+    "allow": [
+      "Bash(python *)"
+    ]
+  }
+}
+```
+
+#### Functional Purpose of Authorization Parameters (for Non-Interactive Mode):
+| Parameter | Value Type | Architectural Description & Functional Purpose |
+| :--- | :--- | :--- |
+| `"defaultMode": "acceptEdits"` | `string` | Configures the host's file sandbox to auto-approve modifications. Allows JINX to perform non-blocking reads and writes of IPC files (`jinx_request.json`, `jinx_response.json`) and target software assets. |
+| `"allow": ["Bash(python *)"]` | `array[string]` | Declarative whitelist of terminal command patterns. Permits the host to launch and execute the JINX orchestrator (`python .agent/jinx.py`) without waiting for manual operator approval. |
+
+### Session Launch and Message Routing Procedure
+
+1. Initialize the Claude Code CLI session within the project root directory:
+   ```bash
+   claude
+   ```
+2. To start a task with JINX, prefix your request or ask Claude explicitly to run JINX:
+   * *“JINX: Add division to calc.py and verify with unit tests”*
+   * *“Please run JINX to implement division”*
+
+Following the developer's explicit instruction, the host will bootstrap the JINX orchestrator via `python .agent/jinx.py "[request]"` and transparently coordinate the transactional rounds of the cognitive cycle until the task is fully verified end-to-end.
+
+
 
