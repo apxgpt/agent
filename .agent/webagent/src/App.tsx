@@ -2,8 +2,7 @@
  * @license
  * SPDX-License-Identifier: Apache-2.0
  */
-
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import {
   Terminal,
@@ -23,7 +22,6 @@ import {
   HelpCircle,
   Globe
 } from "lucide-react";
-
 import { AgentSession } from "./types";
 import CognitiveLoop from "./components/CognitiveLoop";
 import ThoughtStream from "./components/ThoughtStream";
@@ -31,14 +29,12 @@ import FileExplorer from "./components/FileExplorer";
 import TerminalConsole from "./components/TerminalConsole";
 import DiffViewer from "./components/DiffViewer";
 import RunSummary from "./components/RunSummary";
-
 import {
   getSavedSessions,
   saveSessions,
   parseAgentFolder,
   createDefaultLiveSession
 } from "./utils";
-
 import { useLanguage } from "./context/LanguageContext";
 
 export default function App() {
@@ -57,6 +53,7 @@ export default function App() {
   const [activeSessionId, setActiveSessionId] = useState<string>(() => {
     return localStorage.getItem("jinx_active_session_id") || "live-session";
   });
+
   const [activeTab, setActiveTab] = useState<"summary" | "thoughts" | "files" | "console" | "diffs">(() => {
     const saved = localStorage.getItem("jinx_active_tab");
     if (saved === "summary" || saved === "thoughts" || saved === "files" || saved === "console" || saved === "diffs") {
@@ -64,6 +61,7 @@ export default function App() {
     }
     return "summary";
   });
+
   const [confirmReset, setConfirmReset] = useState(false);
 
   // Live polling state
@@ -79,6 +77,22 @@ export default function App() {
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameText, setRenameText] = useState("");
 
+  // Refs that always mirror the latest sessions/activeSessionId. The 2s
+  // polling interval below is only re-created when livePollActive changes,
+  // so fetchLiveSession's own closure can go stale; reading through these
+  // refs instead of the outer state avoids using outdated values when the
+  // interval callback fires.
+  const sessionsRef = useRef(sessions);
+  const activeSessionIdRef = useRef(activeSessionId);
+
+  useEffect(() => {
+    sessionsRef.current = sessions;
+  }, [sessions]);
+
+  useEffect(() => {
+    activeSessionIdRef.current = activeSessionId;
+  }, [activeSessionId]);
+
   const fetchLiveSession = async (silent = false) => {
     if (!silent) setIsSyncing(true);
     try {
@@ -89,9 +103,9 @@ export default function App() {
         setLiveError(null);
         setSearchedPaths([]);
         setLastSyncedAt(new Date().toLocaleTimeString());
-        
+
         const newSession: AgentSession = data.session;
-        
+
         setSessions((prev) => {
           // Find existing live-session or prepend
           const existingIdx = prev.findIndex((s) => s.id === "live-session");
@@ -106,8 +120,13 @@ export default function App() {
           return updated;
         });
 
-        // Set active session to live-session by default if it just loaded successfully
-        if (activeSessionId !== "live-session" && !sessions.find(s => s.id === activeSessionId)) {
+        // Set active session to live-session by default if it just loaded
+        // successfully. Reads from refs (not the outer activeSessionId /
+        // sessions state) so this stays correct even when this call comes
+        // from an older setInterval closure.
+        const currentActiveId = activeSessionIdRef.current;
+        const currentSessions = sessionsRef.current;
+        if (currentActiveId !== "live-session" && !currentSessions.find((s) => s.id === currentActiveId)) {
           setActiveSessionId("live-session");
         }
       } else {
@@ -161,7 +180,6 @@ export default function App() {
     try {
       const fileArray = Array.from(uploadedFiles);
       const parsedSession = await parseAgentFolder(fileArray);
-
       setSessions((prev) => {
         const updated = [parsedSession, ...prev];
         saveSessions(updated);
@@ -181,11 +199,9 @@ export default function App() {
       alert(language === "ru" ? "Нельзя удалить активную сессию мониторинга." : "Cannot delete the active live monitoring session.");
       return;
     }
-
     const updated = sessions.filter((s) => s.id !== id);
     setSessions(updated);
     saveSessions(updated);
-
     if (activeSessionId === id && updated.length > 0) {
       setActiveSessionId(updated[0].id);
     } else if (updated.length === 0) {
@@ -225,7 +241,6 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-[#050505] bg-grid text-neutral-100 flex flex-col font-sans selection:bg-[#4ade80]/20 selection:text-[#4ade80] relative">
-      
       {/* Decorative Subtle Grid overlay */}
       <div className="absolute inset-0 bg-grid pointer-events-none opacity-60 z-0" />
 
@@ -269,7 +284,7 @@ export default function App() {
                 MONITORING v1.2.0
               </div>
             </div>
-            
+
             <div className="flex items-center gap-2">
               {/* Active Session Badge */}
               <div className={`px-3 py-1 rounded-full text-[10px] font-extrabold uppercase tracking-widest flex items-center gap-1.5 shadow-lg ${
@@ -278,8 +293,8 @@ export default function App() {
                   : "bg-[#4ade80] text-black shadow-[0_0_15px_rgba(74,222,128,0.2)]"
               }`}>
                 <span className={`w-1.5 h-1.5 rounded-full ${liveError ? "bg-amber-500 animate-pulse" : "bg-black animate-ping"}`}></span>
-                {liveError 
-                  ? (language === "ru" ? "ОЖИДАНИЕ АГЕНТА" : "WAITING FOR AGENT") 
+                {liveError
+                  ? (language === "ru" ? "ОЖИДАНИЕ АГЕНТА" : "WAITING FOR AGENT")
                   : (language === "ru" ? "АКТИВНЫЙ МОНИТОРИНГ" : "LIVE MONITOR")
                 }
               </div>
@@ -323,10 +338,8 @@ export default function App() {
 
       {/* Main Container */}
       <div className="flex-1 flex flex-col lg:flex-row relative z-10 max-w-7xl w-full mx-auto p-4 md:p-6 gap-6">
-        
         {/* Sidebar Panel */}
         <aside className="w-full lg:w-80 flex-shrink-0 flex flex-col gap-6 relative z-10 order-2 lg:order-none">
-          
           {/* Live Monitor Controls */}
           <div className="bg-[#0c0c0e]/90 border border-white/10 rounded-lg p-5 shadow-xl space-y-4">
             <h3 className="text-[11px] uppercase tracking-[0.2em] font-extrabold text-neutral-400 flex items-center justify-between">
@@ -403,7 +416,7 @@ export default function App() {
                   >
                     <div className="flex items-start justify-between gap-2">
                       <span className={`w-1.5 h-1.5 rounded-full mt-1.5 ${stateColor}`} />
-                      
+
                       {/* Name or Rename block */}
                       {isRenaming ? (
                         <div className="flex-1 flex gap-1 items-center" onClick={(e) => e.stopPropagation()}>
@@ -423,8 +436,8 @@ export default function App() {
                         </div>
                       ) : (
                         <div className="flex-1 font-mono text-xs font-semibold text-neutral-300 truncate">
-                          {session.id === "live-session" 
-                            ? (language === "ru" ? "◉ Машинный Агент Live" : "◉ Live Agent Monitor") 
+                          {session.id === "live-session"
+                            ? (language === "ru" ? "◉ Машинный Агент Live" : "◉ Live Agent Monitor")
                             : session.name
                           }
                         </div>
@@ -483,20 +496,18 @@ export default function App() {
 
         {/* Primary Dashboard Space */}
         <main className="flex-1 flex flex-col gap-6 min-w-0 relative z-10 order-1 lg:order-none">
-          
           {/* Handle Live-Session Error / Setup Guidelines */}
           {activeSessionId === "live-session" && liveError ? (
             <div className="bg-[#0c0c0e]/95 border border-amber-500/20 rounded-lg p-6 md:p-8 shadow-2xl flex flex-col justify-center items-center text-center space-y-6">
               <div className="w-12 h-12 rounded-full bg-amber-500/10 border border-amber-500/30 flex items-center justify-center text-amber-500">
                 <AlertCircle className="w-6 h-6" />
               </div>
-              
               <div className="space-y-2 max-w-lg">
                 <h2 className="text-base font-bold font-mono text-white uppercase tracking-wide">
                   {language === "ru" ? "Ожидание локального Python агента" : "Waiting for local Python Agent..."}
                 </h2>
                 <p className="text-xs text-neutral-400 leading-relaxed">
-                  {language === "ru" 
+                  {language === "ru"
                     ? "Не удалось обнаружить директорию .agent в стандартных путях. Веб-интерфейс работает в режиме реального времени и автоматически отобразит состояние выполнения, как только запустится Python агент."
                     : "The .agent runtime folder could not be found yet. The dashboard automatically syncs with the filesystem to display plans, terminal operations, and git diffs as the Python agent executes."}
                 </p>
@@ -538,7 +549,7 @@ export default function App() {
                       : "2. Run your JINX Python agent which creates the .agent/ directory structure:"}
                   </p>
                   <pre className="bg-black p-2.5 rounded text-[10px] text-amber-400 font-semibold overflow-x-auto">
-                    python jinx.py
+                    python .agent/jinx.py "[user_message]"
                   </pre>
                   <p className="text-neutral-500 text-[10px] italic leading-tight">
                     {language === "ru"
@@ -557,7 +568,6 @@ export default function App() {
                   <RefreshCw className="w-4 h-4" />
                   {language === "ru" ? "Проверить снова" : "Check Folder Now"}
                 </button>
-                
                 {sessions.length > 1 && (
                   <button
                     onClick={() => {
@@ -592,8 +602,8 @@ export default function App() {
                     <span className="text-[10px] font-mono text-neutral-500 uppercase">PID: {currentSession.stats.pid || "N/A"}</span>
                   </div>
                   <h2 className="text-sm md:text-base font-bold text-white font-mono tracking-tight truncate max-w-lg">
-                    {currentSession.id === "live-session" 
-                      ? (language === "ru" ? "Локальный сеанс Python агента" : "Local Python Agent Execution") 
+                    {currentSession.id === "live-session"
+                      ? (language === "ru" ? "Локальный сеанс Python агента" : "Local Python Agent Execution")
                       : currentSession.name
                     }
                   </h2>

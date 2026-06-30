@@ -29,11 +29,20 @@ export default function FileExplorer({ files }: FileExplorerProps) {
     }
   }, [selectedFile]);
 
-  const handleCopy = (text: string) => {
-    navigator.clipboard.writeText(text);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
-  };
+  const [copyFailed, setCopyFailed] = useState(false);
+
+    const handleCopy = async (text: string) => {
+      try {
+        await navigator.clipboard.writeText(text);
+        setCopyFailed(false);
+        setCopied(true);
+        setTimeout(() => setCopied(false), 2000);
+      } catch (err) {
+        console.error("Failed to copy to clipboard", err);
+        setCopyFailed(true);
+        setTimeout(() => setCopyFailed(false), 2000);
+      }
+    };
 
   const getFileIcon = (name: string) => {
     if (name.endsWith(".yaml") || name.endsWith(".yml")) {
@@ -133,7 +142,11 @@ export default function FileExplorer({ files }: FileExplorerProps) {
                 onClick={() => handleCopy(files[selectedFile])}
                 className="p-1.5 rounded border border-white/10 hover:bg-white/5 text-neutral-400 hover:text-[#4ade80] transition-colors flex items-center gap-1.5 text-xs font-mono uppercase cursor-pointer"
               >
-                {copied ? (
+                {copyFailed ? (
+                  <span className="text-red-400 font-bold">
+                    {language === "ru" ? "Ошибка копирования" : "Copy failed"}
+                  </span>
+                ) : copied ? (
                   <>
                     <Check className="w-3.5 h-3.5 text-[#4ade80]" />
                     <span className="text-[#4ade80] font-bold">{t.file_explorer.copied}</span>

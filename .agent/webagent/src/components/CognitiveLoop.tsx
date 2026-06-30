@@ -217,7 +217,7 @@ export default function CognitiveLoop({ currentStatus }: CognitiveLoopProps) {
             </motion.div>
           )}
 
-          <div className="relative border-l border-white/10 ml-4 pl-6 space-y-4">
+          <div className="relative border-l border-white/10 ml-4 pl-5 space-y-4">
             {phases.map((phase, idx) => {
               const Icon = phase.icon;
               const isCompleted = currentIndex > idx;
