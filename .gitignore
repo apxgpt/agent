@@ -16,6 +16,8 @@ ENV/
 *.bak/
 
 # --- Build & Distribution (setuptools) ---
+node_modules/
+coverage/
 build/
 dist/
 *.egg-info/

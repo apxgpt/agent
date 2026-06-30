@@ -2,7 +2,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/JINX-Enterprise_Agent_Runtime-0F172A?style=for-the-badge&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZmlsbD0id2hpdGUiIGQ9Ik0xMiAyTDIgN2wxMCA1IDEwLTV6TTIgMTdsOCA0IDgtNE0yIDEybDggNCA4LTQiLz48L3N2Zz4=" alt="JINX Badge" />
-  <img src="https://img.shields.io/badge/version-1.1.8--enterprise-2563EB?style=for-the-badge" alt="Version Badge" />
+  <img src="https://img.shields.io/badge/version-1.2.0--enterprise-2563EB?style=for-the-badge" alt="Version Badge" />
   <img src="https://img.shields.io/badge/architecture-Process_Isolated_IPC-0D9488?style=for-the-badge" alt="Architecture Badge" />
   <img src="https://img.shields.io/badge/integration-Subprocess_Standard_Streams-059669?style=for-the-badge" alt="Integration Badge" />
 </p>
@@ -625,3 +625,8 @@ JINX 架构规范定义了将运行环境作为托管内核部署在官方 **Ant
 
 基于开发人员的显式指令，宿主将自动调用 `python .agent/jinx.py "[用户请求]"` 引导 JINX 协调器，并管理认知循环的所有事务回合，直至任务在端到端验证后完全解决。
 
+## Web Agent
+  ```bash
+  .agent/webagent/
+  ```
+![截图](images/webagent.jpg)
