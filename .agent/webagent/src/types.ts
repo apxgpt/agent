@@ -68,9 +68,11 @@ export interface AgentSession {
   rpcLog: RPCMessage[];
   terminalLog: string[];
   diffs: CodeDiff[];
+  diffsError?: string | null;
   files: Record<string, string>; // raw contents in .agent folder
   summary?: string;
   facts?: string[];
   debt?: string[];
   open?: string[];
+  copyCount?: number; // how many times this backup was re-uploaded
 }

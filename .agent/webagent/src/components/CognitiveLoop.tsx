@@ -20,6 +20,22 @@ interface PhaseDetail {
   icon: any;
 }
 
+const statusIndexMap: Record<SessionStatus, number> = {
+  idle: -1,
+  perceive: 0,
+  analyze: 1,
+  plan: 2,
+  execute: 3,
+  verify: 4,
+  commit: 5,
+  completed: 6,
+  error: 6,
+};
+
+function getStatusIndex(status: SessionStatus) {
+  return statusIndexMap[status] ?? -1;
+}
+
 export default function CognitiveLoop({ currentStatus }: CognitiveLoopProps) {
   const { language, t } = useLanguage();
 
@@ -75,22 +91,8 @@ export default function CognitiveLoop({ currentStatus }: CognitiveLoopProps) {
     },
   ];
 
-  const getStatusIndex = (status: SessionStatus) => {
-    const map: Record<SessionStatus, number> = {
-      idle: -1,
-      perceive: 0,
-      analyze: 1,
-      plan: 2,
-      execute: 3,
-      verify: 4,
-      commit: 5,
-      completed: 6,
-      error: -2,
-    };
-    return map[status] ?? -1;
-  };
-
   const currentIndex = getStatusIndex(currentStatus);
+  const isErrorState = currentStatus === "error";
 
   return (
     <div id="cognitive-loop-container" className="bg-[#0c0c0e]/90 border border-white/10 rounded-lg p-6 shadow-xl relative overflow-hidden">
@@ -125,10 +127,10 @@ export default function CognitiveLoop({ currentStatus }: CognitiveLoopProps) {
         <div className="hidden lg:grid grid-cols-7 gap-3 relative items-stretch">
           {phases.map((phase, idx) => {
             const Icon = phase.icon;
-            const isCompleted = currentIndex > idx;
-            const isActive = currentIndex === idx;
-            const isPending = currentIndex < idx && currentStatus !== "error";
-            const isError = currentStatus === "error" && idx === Math.max(0, currentIndex);
+            const isCompleted = isErrorState ? idx < phases.length - 1 : currentIndex > idx;
+            const isActive = !isErrorState && currentIndex === idx;
+            const isPending = !isErrorState && currentIndex < idx;
+            const isError = isErrorState && idx === (phases.length - 1);
 
             let borderClass = "border-white/5 bg-black/40";
             let glowClass = "";
@@ -220,9 +222,9 @@ export default function CognitiveLoop({ currentStatus }: CognitiveLoopProps) {
           <div className="relative border-l border-white/10 ml-4 pl-5 space-y-4">
             {phases.map((phase, idx) => {
               const Icon = phase.icon;
-              const isCompleted = currentIndex > idx;
-              const isActive = currentIndex === idx;
-              const isError = currentStatus === "error" && idx === Math.max(0, currentIndex);
+              const isCompleted = isErrorState ? idx < phases.length - 1 : currentIndex > idx;
+              const isActive = !isErrorState && currentIndex === idx;
+              const isError = isErrorState && idx === (phases.length - 1);
               const isIdle = currentStatus === "idle";
 
               let bgClass = "bg-neutral-900 border-neutral-800 text-neutral-500";

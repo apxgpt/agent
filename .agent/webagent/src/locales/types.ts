@@ -13,6 +13,8 @@ export interface TranslationDict {
     session_history: string;
     runs: string;
     confirm_reset: string;
+    newer_live_available: string;
+    switch_to_live: string;
   };
   tabs: {
     summary: string;
@@ -44,6 +46,7 @@ export interface TranslationDict {
     select_file_placeholder: string;
     copied: string;
     copy_to_clipboard: string;
+    copy_failed: string;
   };
   terminal: {
     terminal_io: string;
