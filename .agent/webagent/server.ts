@@ -2,7 +2,6 @@
  * @license
  * SPDX-License-Identifier: Apache-2.0
  */
-
 import express from "express";
 import path from "path";
 import fs from "fs";
@@ -18,7 +17,29 @@ const app = express();
 const isAiStudio = process.cwd() === "/" || fs.existsSync("/metadata.json");
 const PORT = isAiStudio ? 3000 : (process.env.PORT ? parseInt(process.env.PORT) : 3301);
 
+// --- Security: bind host & API token -----------------------------------
+// By default the dashboard only listens on localhost. Anyone wanting to
+// expose it on the LAN/network must explicitly set DASHBOARD_BIND_HOST,
+// and is strongly encouraged to also set DASHBOARD_API_TOKEN so that
+// /api/live-session (which can return file contents from .agent) is not
+// reachable by anyone else on the network without a token.
+const BIND_HOST = process.env.DASHBOARD_BIND_HOST || "127.0.0.1";
+const API_TOKEN = process.env.DASHBOARD_API_TOKEN || "";
+
 app.use(express.json({ limit: "50mb" }));
+
+// Require a bearer token on protected routes when DASHBOARD_API_TOKEN is set.
+// If no token is configured, access still defaults to localhost-only via
+// BIND_HOST, so local development keeps working without extra setup.
+function requireAuth(req: express.Request, res: express.Response, next: express.NextFunction) {
+  if (!API_TOKEN) return next();
+  const header = req.headers.authorization || "";
+  const token = header.startsWith("Bearer ") ? header.slice(7) : "";
+  if (token !== API_TOKEN) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  next();
+}
 
 // Helper to find the .agent folder
 function findAgentDir(): string | null {
@@ -53,6 +74,23 @@ function findAgentDir(): string | null {
   return null;
 }
 
+// Walk upwards from a starting directory until a .git folder is found.
+// This is used instead of process.cwd() because the dashboard is typically
+// started from .agent/webagent, where .git normally doesn't exist — only
+// the actual repository root (usually one or two levels above .agent) has it.
+function findGitRoot(startDir: string): string | null {
+  let dir = startDir;
+  for (let i = 0; i < 20; i++) {
+    if (fs.existsSync(path.join(dir, ".git"))) {
+      return dir;
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) break; // reached filesystem root
+    dir = parent;
+  }
+  return null;
+}
+
 // Function to parse diff text
 function parseDiffText(filename: string, text: string) {
   const diffs: any[] = [];
@@ -79,7 +117,6 @@ function parseDiffText(filename: string, text: string) {
       const match = line.match(/b\/(.+)$/);
       if (match) currentFile = match[1];
     }
-
     currentDiffLines.push(line);
     if (line.startsWith("+") && !line.startsWith("+++")) additions++;
     if (line.startsWith("-") && !line.startsWith("---")) deletions++;
@@ -109,7 +146,7 @@ function parseDiffText(filename: string, text: string) {
 }
 
 // REST Endpoint to fetch real live agent logs from .agent directory
-app.get("/api/live-session", (req, res) => {
+app.get("/api/live-session", requireAuth, (req, res) => {
   const agentDir = findAgentDir();
 
   if (!agentDir) {
@@ -191,10 +228,10 @@ app.get("/api/live-session", (req, res) => {
         const totalReqs = Object.keys(score.requirements || {}).length;
         const passCount = score.pass_count || 0;
         const isLatest = score.round === scores.length;
-        const stepStatus = score.all_pass 
-          ? "completed" 
-          : (isLatest && status !== "completed" && status !== "error") 
-            ? "running" 
+        const stepStatus = score.all_pass
+          ? "completed"
+          : (isLatest && status !== "completed" && status !== "error")
+            ? "running"
             : "failed";
 
         return {
@@ -237,7 +274,7 @@ app.get("/api/live-session", (req, res) => {
             if (role === "assistant") {
               let textContent = "";
               const blocks = Array.isArray(content) ? content : (typeof content === "string" ? [{ type: "text", text: content }] : []);
-              
+
               blocks.forEach((block: any) => {
                 if (block.type === "text") {
                   textContent += block.text || "";
@@ -278,6 +315,7 @@ app.get("/api/live-session", (req, res) => {
               }
             } else if (role === "user") {
               const blocks = Array.isArray(content) ? content : (typeof content === "string" ? [{ type: "text", text: content }] : []);
+
               blocks.forEach((block: any) => {
                 if (block.type === "tool_result" || block.tool_use_id) {
                   const toolId = block.tool_use_id;
@@ -336,14 +374,19 @@ app.get("/api/live-session", (req, res) => {
         });
       }
 
-      // Gather real live workspace diff using git diff
+      // Gather real live workspace diff using git diff.
+      // Resolved relative to the actual repository root (walked up from
+      // agentDir), not process.cwd() — the server is typically started from
+      // .agent/webagent, which usually has no .git of its own.
       let diffs: any[] = [];
-      if (fs.existsSync(path.join(process.cwd(), ".git"))) {
+      const repoRoot = findGitRoot(agentDir);
+      if (repoRoot) {
         try {
           const gitDiff = execSync("git diff", {
             encoding: "utf8",
-            cwd: process.cwd(),
-            stdio: ["ignore", "pipe", "ignore"]
+            cwd: repoRoot,
+            stdio: ["ignore", "pipe", "ignore"],
+            timeout: 5000
           });
           if (gitDiff && gitDiff.trim()) {
             diffs = parseDiffText("workspace.diff", gitDiff);
@@ -525,7 +568,6 @@ app.get("/api/live-session", (req, res) => {
         files,
       },
     });
-
   } catch (error: any) {
     const message = error?.message || (error ? String(error) : "Failed to load live agent session");
     res.status(500).json({ error: message });
@@ -548,8 +590,15 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://0.0.0.0:${PORT}`);
+  app.listen(PORT, BIND_HOST, () => {
+    console.log(`Server running on http://${BIND_HOST}:${PORT}`);
+    if (BIND_HOST !== "127.0.0.1" && BIND_HOST !== "localhost" && !API_TOKEN) {
+      console.warn(
+        "WARNING: dashboard is bound to a non-localhost host without DASHBOARD_API_TOKEN set. " +
+        "Anyone reachable on this network can read your .agent folder contents via /api/live-session. " +
+        "Set DASHBOARD_API_TOKEN to require authentication."
+      );
+    }
   });
 }
 
