@@ -147,6 +147,18 @@ def parse_state_block(text: str) -> Optional[Dict[str, Any]]:
     code_matches = list(re.finditer(code_block_pattern, text, re.DOTALL))
 
     state_keys = {"task", "facts", "scores", "debt", "open", "exit_ready", "deadlock"}
+    # Strong markers — these rarely appear in prose so any one of them is a
+    # reliable signal that the block is a real state update. We deliberately
+    # exclude "task" and "open" from this set because they are common English
+    # words and would cause false positives when LLMs embed explanatory YAML.
+    strong_marker_keys = {"scores", "facts", "debt", "exit_ready", "deadlock"}
+
+    def _looks_like_state(d: Dict[str, Any]) -> bool:
+        keys = set(d.keys()) & state_keys
+        # Either has the canonical "state:" wrapper, or contains at least one
+        # strongly identifying marker. Bare "task" / "open" alone is not enough
+        # because they appear in normal prose.
+        return bool(d.get("state") or (keys & strong_marker_keys))
 
     if code_matches:
         for match in reversed(code_matches):
@@ -154,12 +166,10 @@ def parse_state_block(text: str) -> Optional[Dict[str, Any]]:
             try:
                 data = yaml.safe_load(raw)
                 if isinstance(data, dict):
-                    # Support both flat and nested state blocks even when only one
-                    # recognized state field is present (for example exit_ready).
-                    if len(set(data.keys()) & state_keys) >= 1:
-                        return data
                     nested = data.get("state")
-                    if isinstance(nested, dict) and len(set(nested.keys()) & state_keys) >= 1:
+                    if _looks_like_state(data):
+                        return data
+                    if isinstance(nested, dict) and _looks_like_state(nested):
                         return data
             except yaml.YAMLError:
                 continue
