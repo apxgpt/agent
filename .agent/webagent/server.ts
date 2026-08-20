@@ -49,12 +49,13 @@ function requireAuth(req: express.Request, res: express.Response, next: express.
   next();
 }
 
-// Helper to find the .agent folder
+const AGENT_MARKERS = ["JINX.yaml"];
+
 function findAgentDir(): string | null {
   const pathsToTry = [
     path.join(process.cwd(), ".agent"),
     path.join(process.cwd(), "../.agent"),
-    path.join(process.cwd(), ".."), // if inside webagent, process.cwd() is .../.agent/webagent, so '..' is the .agent folder
+    path.join(process.cwd(), ".."),
   ];
 
   for (const p of pathsToTry) {
@@ -64,23 +65,17 @@ function findAgentDir(): string | null {
     } catch {
       continue;
     }
-    if (fs.existsSync(resolved) && fs.statSync(resolved).isDirectory()) {
-      // Confirm it looks like an agent folder (has JINX.yaml, state.json, plan.json, or other typical files)
-      if (
-        fs.existsSync(path.join(resolved, "JINX.yaml")) ||
-        fs.existsSync(path.join(resolved, "state.yaml")) ||
-        fs.existsSync(path.join(resolved, "state.json")) ||
-        fs.existsSync(path.join(resolved, "plan.yaml")) ||
-        fs.existsSync(path.join(resolved, "plan.json")) ||
-        fs.existsSync(path.join(resolved, "thoughts.yaml")) ||
-        fs.existsSync(path.join(resolved, "thoughts.json")) ||
-        fs.existsSync(path.join(resolved, "thought.yaml")) ||
-        fs.existsSync(path.join(resolved, "thought.json")) ||
-        fs.existsSync(path.join(resolved, "terminal.log")) ||
-        fs.existsSync(path.join(resolved, "stdout.log"))
-      ) {
-        return resolved;
-      }
+    if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) {
+      continue;
+    }
+
+    const basename = path.basename(resolved);
+    const hasAgentMarker = AGENT_MARKERS.some((m) => fs.existsSync(path.join(resolved, m)));
+    // Only accept directories that either are named `.agent` or that contain
+    // the expected JINX marker files. Do NOT accept the parent directory
+    // fallback unless its real basename is `.agent` or it contains markers.
+    if (basename === ".agent" || hasAgentMarker) {
+      return resolved;
     }
   }
 
@@ -168,6 +163,15 @@ function getLiveSessionData() {
     };
   }
 
+  const jinxYamlPath = path.join(agentDir, "JINX.yaml");
+  if (!fs.existsSync(jinxYamlPath)) {
+    return {
+      exists: false,
+      message: "No JINX.yaml found in the detected .agent folder.",
+      searchedPaths: [agentDir],
+    };
+  }
+
   const files: Record<string, string> = {};
 
   // Read top-level .agent files
@@ -194,7 +198,6 @@ function getLiveSessionData() {
   }
 
   // Check for JINX-native agent first
-  const jinxYamlPath = path.join(agentDir, "JINX.yaml");
   const jinxRunStatePath = path.join(agentDir, "jinx_run_state.yaml");
 
   if (fs.existsSync(jinxYamlPath)) {
@@ -217,13 +220,26 @@ function getLiveSessionData() {
     else if (fs.existsSync(jinxRunStatePath)) {
       try {
         const runStateData = YAML.parse(fs.readFileSync(jinxRunStatePath, "utf8"));
-        if (runStateData?.waiting_for === "tool_calls") {
-          status = "execute";
+        const waitingFor = runStateData?.waiting_for;
+        const toolDepth = runStateData?.tool_depth || 0;
+        const rnd = runStateData?.rnd || 1;
+        const hasScores = scores.length > 0;
+
+        if (waitingFor === "llm_generate") {
+          if (toolDepth > 0) {
+            status = "verify";
+          } else if (rnd === 1 && !hasScores) {
+            status = "perceive";
+          } else {
+            status = "plan";
+          }
+        } else if (waitingFor === "tool_calls") {
+          status = toolDepth > 0 ? "commit" : "execute";
         } else {
-          status = "analyze";
+          status = "error";
         }
       } catch (e) {
-        status = "execute";
+        status = "error";
       }
     }
 
@@ -414,143 +430,10 @@ function getLiveSessionData() {
     };
   }
 
-  // LEGACY RETRO-COMPATIBILITY FALLBACK FLOW
-  let status = "idle";
-  let pid = 0;
-  const errors: string[] = [];
-
-  const stateKey = files["state.yaml"] ? "state.yaml" : (files["state.json"] ? "state.json" : null);
-  if (stateKey) {
-    try {
-      const stateObj = YAML.parse(files[stateKey]);
-      status = (stateObj.phase || stateObj.status || "idle").toLowerCase();
-      pid = stateObj.active_pid || stateObj.pid || 0;
-      if (stateObj.errors && Array.isArray(stateObj.errors)) {
-        errors.push(...stateObj.errors);
-      }
-    } catch (e) {
-      console.error("Failed to parse state file", e);
-    }
-  }
-
-  let plan: any[] = [];
-  const planKey = files["plan.yaml"] ? "plan.yaml" : (files["plan.json"] ? "plan.json" : null);
-  if (planKey) {
-    try {
-      const parsed = YAML.parse(files[planKey]);
-      const rawList = Array.isArray(parsed) ? parsed : (parsed.steps || parsed.plan || []);
-      plan = rawList.map((p: any, idx: number) => {
-        if (typeof p === "string") {
-          return { id: `step-${idx}`, title: p, description: "", status: "pending" };
-        }
-        return {
-          id: p.id || `step-${idx}`,
-          title: p.title || p.name || "Untitled Step",
-          description: p.description || p.desc || "",
-          status: p.status || "pending",
-        };
-      });
-    } catch (e) {
-      console.error("Failed to parse plan file", e);
-    }
-  }
-
-  let thoughts: any[] = [];
-  const thoughtsKey = files["thoughts.yaml"] ? "thoughts.yaml" : (files["thoughts.json"] ? "thoughts.json" : (files["thought.yaml"] ? "thought.yaml" : (files["thought.json"] ? "thought.json" : null)));
-  if (thoughtsKey) {
-    try {
-      const parsed = YAML.parse(files[thoughtsKey]);
-      const rawList = Array.isArray(parsed) ? parsed : [];
-      thoughts = rawList.map((t: any, idx: number) => {
-        return {
-          id: t.id || `thought-${idx}`,
-          timestamp: t.timestamp || new Date().toISOString(),
-          text: t.text || t.thought || (typeof t === "string" ? t : ""),
-          phase: (t.phase || "execute").toLowerCase(),
-          category: t.category || "monologue",
-        };
-      });
-    } catch (e) {
-      console.error("Failed to parse thoughts", e);
-    }
-  }
-
-  let rpcLog: any[] = [];
-  const rpcKey = ["rpc.log", "rpc_log.json", "ipc.log", "rpc.json"].find((k) => files[k] !== undefined);
-  if (rpcKey && files[rpcKey]) {
-    const rpcLines = files[rpcKey].split("\n").filter((l) => l.trim().length > 0);
-    rpcLog = rpcLines.map((line, idx) => {
-      try {
-        const parsed = JSON.parse(line);
-        return {
-          id: parsed.id || `rpc-${idx}`,
-          direction: parsed.direction || "sent",
-          timestamp: parsed.timestamp || new Date().toISOString(),
-          method: parsed.method || "unknown",
-          params: parsed.params,
-          result: parsed.result,
-          error: parsed.error,
-        };
-      } catch (e) {
-        return {
-          id: `rpc-${idx}`,
-          direction: "sent",
-          timestamp: new Date().toISOString(),
-          method: "raw_log",
-          params: { raw: line },
-        };
-      }
-    });
-  }
-
-  let terminalLog: string[] = [];
-  const termKey = ["terminal.log", "stdout.log", "stdout", "stderr.log"].find((k) => files[k] !== undefined);
-  if (termKey && files[termKey]) {
-    terminalLog = files[termKey].split("\n").filter((l) => l.trim().length > 0);
-  }
-
-  let diffs: any[] = [];
-  const diffKey = ["diffs.patch", "diff.patch", "patch.diff"].find((k) => files[k] !== undefined);
-  if (diffKey && files[diffKey]) {
-    diffs = parseDiffText(diffKey, files[diffKey]);
-  }
-
-  if (thoughts.length === 0) {
-    thoughts = [
-      {
-        id: "live-fall-1",
-        timestamp: new Date().toISOString(),
-        text: `Listening to .agent folder. Detected files: ${Object.keys(files).join(", ")}.`,
-        phase: status === "idle" ? "perceive" : status,
-        category: "system",
-      },
-    ];
-  }
-
   return {
-    exists: true,
-    path: agentDir,
-    session: {
-      id: "live-session",
-      name: "MachineGPT Live Agent Run",
-      timestamp: new Date().toISOString(),
-      status,
-      elapsedTime: 0,
-      stats: {
-        promptTokens: 0,
-        completionTokens: 0,
-        estimatedCost: 0,
-        pid,
-        hostname: os.hostname(),
-        os: process.platform,
-      },
-      plan,
-      thoughts,
-      rpcLog,
-      terminalLog,
-      diffs,
-      files,
-    },
+    exists: false,
+    message: "No JINX.yaml found in .agent folder. JINX agent is not running.",
+    searchedPaths: [agentDir],
   };
 }
 
