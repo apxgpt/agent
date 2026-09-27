@@ -29,9 +29,11 @@ import yaml
 import threading
 import queue as _queue
 
+from . import prompts
 from .prompts import SYSTEM_PROMPT, TOOL_DEPTH_CRITICAL_MSG, construct_round_prompt
 from .state import merge_state, read_jinx, write_jinx
 from .tools import tool_schema
+from . import learning, selfpatch
 
 logger = logging.getLogger("jinx.runner")
 
@@ -81,29 +83,18 @@ class Yaml:
     def dump_to_string(data: Any, width: int = sys.maxsize) -> str:
         """Serializes structures to YAML strings using the isolated dumper.
 
-        Keeps blank lines inside block scalars intact; only removes truly empty
-        cosmetic lines that are not part of a multiline scalar value.
+        Blank lines are preserved verbatim: they occur inside literal block
+        scalars (``str_presenter`` renders multi-line strings with ``style='|'``)
+        where removing them would change the value, so no blank-line rewriting
+        is attempted. Compaction of the state block happens upstream in
+        ``state.merge_scores`` / ``state.merge_text_list``, where it is lossless.
         """
         try:
             raw = yaml.dump(
                 data, Dumper=Dumper, allow_unicode=True,
                 default_flow_style=False, sort_keys=False, width=width
             )
-            lines = raw.splitlines()
-            cleaned: List[str] = []
-            in_block_scalar = False
-            for line in lines:
-                if line.startswith(" ") and line.strip() == "" and in_block_scalar:
-                    cleaned.append(line)
-                    continue
-                if re.match(r"^\s*[-?][\s\S]*$", line) or line.strip() == "":
-                    if line.strip() == "":
-                        # Preserve blank lines inside literal/folded blocks; keep only
-                        # separators between top-level entries.
-                        cleaned.append(line)
-                        continue
-                cleaned.append(line)
-            return '\n'.join(cleaned) + ('\n' if cleaned and cleaned[-1] else '')
+            return raw if raw.endswith('\n') or not raw else raw + '\n'
         except Exception as e:
             raise SerializationError(f"Failed to serialize YAML string: {e}") from e
 
@@ -417,10 +408,24 @@ def _signal_cleanup(signum=None, frame=None) -> None:
         logger.info("Signal %s received: cleaning up IPC files.", signum)
     except Exception:
         pass
-    try:
-        clean_up_ipc_files()
-    except Exception:
-        pass
+    # Escape hatch: keep the IPC files so a run interrupted mid-round can be
+    # inspected or resumed. Deleting them on Ctrl+C destroys the only record of
+    # what the model was last told, which is usually exactly what you need when
+    # a loop is misbehaving. Set JINX_KEEP_IPC_ON_SIGNAL=1 to preserve them.
+    keep = os.environ.get("JINX_KEEP_IPC_ON_SIGNAL", "").strip().lower() in ("1", "true", "yes", "on")
+    if keep:
+        try:
+            logger.warning(
+                "JINX_KEEP_IPC_ON_SIGNAL set: preserving IPC files (request/run-state) "
+                "for inspection."
+            )
+        except Exception:
+            pass
+    else:
+        try:
+            clean_up_ipc_files()
+        except Exception:
+            pass
     # Use os._exit to avoid sys.exit raising SystemExit inside a signal handler,
     # which can cause recursion if the handler itself was invoked during cleanup.
     try:
@@ -461,6 +466,186 @@ def _init_new_session(task: str, jinx: Dict[str, Any]) -> None:
         "open": [], "exit_ready": False, "deadlock": False
     })
     write_jinx(jinx)
+    # NOTE: the durable lesson ledger in .agent/lessons.yaml is deliberately left
+    # untouched. A new task wipes working memory, but what was learned is exactly
+    # what should carry over; resetting it here would make the store decay at the
+    # same rate as the state it is supposed to outlast.
+
+
+def _inject_lessons(run_state: Dict[str, Any]) -> Tuple[str, List[str]]:
+    """Renders the bounded LEARNED RULES block and records what was injected.
+
+    Returns the block text and the normalized keys of the lessons actually shown,
+    which the caller must pass to :func:`write_llm_request` so they survive the
+    next process. The NEXT round then credits or blames exactly those lessons,
+    and no others. Without that round-trip the ledger could not tell a proven
+    rule from a useless one.
+    """
+    if not selfpatch.SELF_PATCH_ENABLED:
+        return "", []
+    try:
+        ledger = learning.load_ledger()
+        rendered = learning.render_lessons(ledger.get("lessons"))
+    except Exception as e:  # never let the learning store break a round
+        logger.error("Lesson injection failed: %s", e, exc_info=True)
+        return "", []
+    run_state["applied_lessons"] = rendered["applied"]
+    return rendered["text"], rendered["applied"]
+
+
+def _close_lesson_bookkeeping(
+    run_state: Dict[str, Any], passed: Optional[bool]
+) -> None:
+    """Credits or blames the lessons that were injected into the finished round."""
+    applied = run_state.get("applied_lessons") or []
+    if not applied:
+        return
+    try:
+        ledger = learning.load_ledger()
+        ledger["lessons"] = learning.record_outcome(
+            ledger.get("lessons"), applied, bool(passed)
+        )
+        learning.save_ledger(ledger)
+    except Exception as e:
+        logger.error("Lesson bookkeeping failed: %s", e, exc_info=True)
+    finally:
+        run_state.pop("applied_lessons", None)
+
+
+def _rollback_and_report(reason: str) -> str:
+    """Rolls the self-patch back and builds the model's refusal message.
+
+    The rollback is reported separately from the reason because the two can
+    disagree: a partially failed restore leaves files on disk that the model
+    believes were undone, and saying so is the only way it can find out.
+    """
+    try:
+        restored = selfpatch.restore_baseline()
+    except Exception as e:
+        logger.error("Self-patch rollback failed: %s", e, exc_info=True)
+        return (
+            "SELF-PATCH REFUSED and ROLLBACK FAILED: %s\nThe rollback itself "
+            "raised %s: %s. Treat JINX's source as untrustworthy and ask a human "
+            "before continuing — the next run's preflight will retry the repair "
+            "from the baseline." % (reason, type(e).__name__, e)
+        )
+    logger.warning("Self-patch protection gate reverted %d file(s)", len(restored))
+    return (
+        "SELF-PATCH REFUSED: %s\nFiles rolled back: %s"
+        % (reason, ", ".join(restored) or "none")
+    )
+
+
+def _enforce_self_patch_gate(run_state: Dict[str, Any]) -> Optional[str]:
+    """Verifies or reverts self-edits. Returns feedback for the model, or None.
+
+    Returning the message rather than pushing it into ``history`` and a carried
+    ``self_patch_feedback`` field keeps a single delivery path: the caller
+    appends it once, after the tool results, so the model reads it in the order
+    the protocol requires and cannot receive it twice.
+    """
+    if not selfpatch.SELF_PATCH_ENABLED:
+        return None
+    if not selfpatch.BASELINE_DIR.exists():
+        return None
+    try:
+        changed = selfpatch.baseline_changed()
+    except Exception as e:
+        logger.error("Self-patch diff failed: %s", e, exc_info=True)
+        return None
+    if not changed:
+        # Keep the baseline: it is the reference for the whole run, not a
+        # one-shot checkpoint. Clearing it on an unchanged round would disarm
+        # the gate before any tool call had a chance to break something.
+        return None
+
+    # Re-check protection against the baseline before verifying. `guard_tool_call`
+    # only ever sees `file_write`, so a brake weakened through `bash_exec` would
+    # otherwise sail through a green test suite and be adopted as the baseline.
+    try:
+        for name in changed:
+            # 1. Block any edit to PROTECTED_FILES
+            if name in selfpatch.PROTECTED_FILES:
+                return _rollback_and_report(
+                    prompts.PROTECTED_FILE_REFUSAL % name
+                )
+
+            # 2. Check for symbol violations in other files.
+            # We must treat the change as a whole-file rewrite to detect
+            # deletions or shadowing of protected symbols.
+            base_path = selfpatch._target_for(name)
+            old_text = base_path.read_text(encoding="utf-8", errors="replace")
+            current_text = selfpatch.snapshot().get(name, "")
+
+            violations = selfpatch._violations_against(
+                name, current_text, old_text, whole_file=True
+            )
+            if violations:
+                detail = "; ".join(violations)
+                return _rollback_and_report(
+                    prompts.PROTECTED_SYMBOL_REFUSAL % (name, detail)
+                )
+    except Exception as e:
+        # Fail closed. If the check itself cannot run, this round has no evidence
+        # that the brake survived, and "no evidence of a violation" is not the
+        # same as "no violation": continuing would let `capture_baseline` adopt
+        # whatever is on disk as the new trusted reference.
+        logger.error("Self-patch protection check failed: %s", e, exc_info=True)
+        return _rollback_and_report(
+            prompts.PROTECTION_CHECK_FAILURE % (type(e).__name__, e)
+        )
+
+    # Put the tests and test configuration back BEFORE the suite runs. They are
+    # the yardstick the patch is about to be measured with, so leaving a weakened
+    # or skipped test in place would let the model edit the answer instead of the
+    # framework. Source changes are deliberately left alone here: they are the
+    # thing under test, and a failing patch is reverted below anyway.
+    try:
+        selfpatch.restore_baseline(only=selfpatch.REPO_PREFIX)
+    except Exception as e:
+        logger.error("Could not restore the test files: %s", e, exc_info=True)
+        return _rollback_and_report(
+            "the test files that decide whether this patch is acceptable could "
+            "not be restored (%s: %s), so it was not verified against a trusted "
+            "suite" % (type(e).__name__, e)
+        )
+
+    result = selfpatch.verify(AGENT_DIR.parent)
+    if result["ok"]:
+        logger.info("Self-patch verified: %s", ", ".join(changed))
+        # Adopt the verified edit as the new reference so the same diff is not
+        # re-verified on every later round.
+        selfpatch.capture_baseline()
+        return None
+
+    restored = selfpatch.restore_baseline()
+    message = (
+        "SELF-PATCH REVERTED: your edit to the files JINX verifies (%s) failed "
+        "verification (%s). The change was rolled back automatically, so the "
+        "framework is intact — the round was not wasted, it produced evidence. "
+        "Read the failure below, decide whether the idea is still right, and if "
+        "so apply it in a smaller or more targeted form.\n%s"
+        % (
+            ", ".join(changed),
+            result["summary"],
+            "\n".join("[%s] %s" % (c["name"], c["tail"]) for c in result["checks"]),
+        )
+    )
+    logger.warning("Self-patch gate reverted %d file(s)", len(restored))
+    return message
+
+
+def _finish_run() -> None:
+    """Terminal cleanup for a run that ended on its own terms.
+
+    The self-patch baseline is dropped here because the run is over and the next
+    task recaptures it. It is intentionally NOT dropped on the error exits: a run
+    that died with a half-applied self-edit should leave the baseline behind so
+    the bootstrap preflight can still roll that edit back on the next invocation.
+    """
+    if selfpatch.SELF_PATCH_ENABLED:
+        selfpatch.clear_baseline()
+    clean_up_ipc_files()
 
 
 def _touch_run_state(run_state: Dict[str, Any]) -> Dict[str, Any]:
@@ -510,34 +695,186 @@ def _extract_last_tool_calls(history: List[Dict[str, Any]]) -> List[Dict[str, An
     return []
 
 
+HISTORY_WINDOW: int = int(os.getenv("JINX_HISTORY_WINDOW", "6"))
+HISTORY_PERSIST_WINDOW: int = int(os.getenv("JINX_HISTORY_PERSIST_WINDOW", "8"))
+# Bound on the memoized tool results kept in the run state. Large enough to cover
+# a deep tool loop, small enough that the cache never dominates the file.
+TOOL_RESULT_CACHE_CAP: int = int(os.getenv("JINX_TOOL_RESULT_CACHE_CAP", "64"))
+
+
+def _has_orphan_tool_result(msg: Dict[str, Any]) -> bool:
+    """True when the message is a tool_result with no preceding tool_use.
+
+    A history window can slice between a ``tool_use`` and its ``tool_result``.
+    Sending an orphan ``tool_result`` to a chat-completions style API is a hard
+    error, so the window is nudged forward until it starts on a safe message.
+    """
+    content = msg.get("content")
+    if not isinstance(content, list):
+        return False
+    return any(
+        isinstance(b, dict) and b.get("type") == "tool_result"
+        for b in content
+    )
+
+
+def _has_unanswered_tool_use(msg: Dict[str, Any]) -> bool:
+    """True when the message requests tools, i.e. its results come later."""
+    content = msg.get("content")
+    if not isinstance(content, list):
+        return False
+    return any(
+        isinstance(b, dict) and b.get("type") == "tool_use"
+        for b in content
+    )
+
+
 def compact_history_for_request(
-    history: List[Dict[str, Any]], max_messages: int = 6
+    history: List[Dict[str, Any]], max_messages: Optional[int] = None
 ) -> List[Dict[str, Any]]:
-    """Keeps the most recent exchange while trimming stale repeated context."""
-    if len(history) <= max_messages:
-        return history
-    return history[-max_messages:]
+    """Keeps only the most recent exchange, dropping orphaned tool blocks.
+
+    The window is advanced past a leading ``tool_result`` block so the model
+    never receives a result whose request is not in the window. This bounds both
+    what is sent and what is persisted, which is what keeps the run-state file
+    from growing without limit across a long task.
+    """
+    limit = HISTORY_WINDOW if max_messages is None else max_messages
+    if limit <= 0 or len(history) <= limit:
+        window = list(history)
+    else:
+        window = list(history[-limit:])
+    while window and _has_unanswered_tool_use(window[-1]):
+        window = window[:-1]
+    idx = 0
+    # Advance past every orphaned tool_result, including a window that consists of
+    # exactly one message: keeping the last element unconditionally would let a
+    # lone tool_result reach the API with no tool_use to answer.
+    while idx < len(window) and _has_orphan_tool_result(window[idx]):
+        idx += 1
+    return window[idx:]
+
+
+def summarize_dropped_history(
+    dropped: List[Dict[str, Any]], kept: List[Dict[str, Any]]
+) -> Optional[Dict[str, Any]]:
+    """Builds a one-message digest of history that fell outside the window.
+
+    ``kept`` is the window the model actually receives, so ``dropped`` should be
+    measured against that same window — otherwise the count describes what was
+    written to disk rather than what the model was shown.
+
+    Nothing is lost: the durable record lives in ``JINX.yaml`` via the score
+    history, and this note tells the model how much earlier context was elided so
+    it does not assume the window is the whole session.
+    """
+    if not dropped:
+        return None
+    rounds = [d for d in dropped if isinstance(d, dict)]
+    tool_msgs = sum(1 for d in rounds if _has_unanswered_tool_use(d) or _has_orphan_tool_result(d))
+    return {
+        "role": "user",
+        "content": (
+            "[context note] %d earlier message(s) from this session were elided from "
+            "the history window to bound prompt size; %d of them involved tool "
+            "traffic. Their substance is preserved in the score history in CURRENT "
+            "STATE (see 'scores'). Do not assume this window is the whole session."
+            % (len(rounds), tool_msgs)
+        ),
+    }
+
+
+def _update_tool_result_cache(
+    cache: Optional[Dict[str, str]], results: List[Dict[str, Any]]
+) -> Dict[str, str]:
+    """Records tool results keyed by ``tool_use_id``, bounded to recent entries.
+
+    Memoization exists so a retried ``tool_calls`` request can be answered from
+    the cache instead of re-running side effects. Storing only the id (as
+    ``processed_tool_use_ids`` does) is not enough: the host is told a call was
+    processed but is given no way to recover what it produced, so the safe
+    response is to skip the call and lose the result.
+
+    The cache is capped because it is persisted in the run state; without a bound
+    it would simply relocate the unbounded-growth problem this work removed.
+    Re-recording an id moves it to the newest slot so eviction keeps live calls.
+    """
+    merged: Dict[str, str] = dict(cache or {})
+    for r in results or []:
+        if not isinstance(r, dict):
+            continue
+        tid = r.get("tool_use_id")
+        if not isinstance(tid, str) or not tid:
+            continue
+        content = r.get("content")
+        if content is None:
+            text = ""
+        elif isinstance(content, str):
+            text = content
+        else:
+            text = Yaml.dump_to_string(content).strip()
+        merged.pop(tid, None)
+        merged[tid] = text
+    if len(merged) > TOOL_RESULT_CACHE_CAP:
+        for old in list(merged)[: len(merged) - TOOL_RESULT_CACHE_CAP]:
+            merged.pop(old, None)
+    return merged
 
 
 def write_llm_request(
-    history: List[Dict[str, Any]], rnd: int, tool_depth: int, min_rounds: int,
-    retry: bool = False
-) -> None:
-    """Writes the current prompt/history state and requests LLM generation."""
-    # Include persisted processed tool_use ids and an optional retry indicator
-    processed_ids: List[str] = []
+        history: List[Dict[str, Any]], rnd: int, tool_depth: int, min_rounds: int,
+        retry: bool = False, applied_lessons: Optional[List[str]] = None
+    ) -> None:
+    """Writes the current prompt/history state and requests LLM generation.
+
+    Only the bounded history window is both sent and persisted. The full
+    transcript is not written to disk, because nothing ever reads it back: the
+    request uses the window, exit and deadlock detection read the score history
+    in ``JINX.yaml``, and tool dispatch only needs the most recent calls.
+
+    When messages fall outside the window a one-line notice is prepended to the
+    request only. It is deliberately not persisted, so the synthetic note cannot
+    accumulate one entry per round.
+    """
+    carried: Dict[str, Any] = {}
     try:
         if RUN_STATE_PATH.exists():
             existing = Yaml.load_from_file(RUN_STATE_PATH)
             if isinstance(existing, dict):
-                processed_ids = existing.get("processed_tool_use_ids", []) or []
+                carried = existing
     except Exception:
-        processed_ids = []
+        carried = {}
+
+    processed_ids: List[str] = carried.get("processed_tool_use_ids", []) or []
+    result_cache: Dict[str, str] = carried.get("tool_result_cache", {}) or {}
+
+    persist_window = compact_history_for_request(history, HISTORY_PERSIST_WINDOW)
+    send_window = compact_history_for_request(history)
+
+    # The notice describes what the MODEL was not shown, so the baseline must be
+    # the send window. The persist window is deliberately larger, so measuring
+    # against it would silently omit the messages that live in the gap between the
+    # two and under-report the elided count on every round.
+    kept = {id(m) for m in send_window}
+    dropped = [m for m in history if id(m) not in kept]
+    messages = list(send_window)
+    notice = summarize_dropped_history(dropped, send_window)
+    if notice:
+        messages.insert(0, notice)
+
+    # A self-patch reverted by the bootstrap preflight leaves its explanation in
+    # the run state. It is surfaced here because this is the one funnel every
+    # llm_generate request passes through, and the run state is rebuilt from
+    # explicit keys below, so the marker is consumed exactly once.
+    feedback = carried.get("self_patch_feedback")
+    if isinstance(feedback, str) and feedback:
+        messages.insert(0, {"role": "user", "content": feedback})
 
     request_payload = {
         "type": "llm_generate", "system": SYSTEM_PROMPT,
-        "messages": compact_history_for_request(history), "tools": tool_schema(),
-        "processed_tool_use_ids": processed_ids, "retry": bool(retry)
+        "messages": messages, "tools": tool_schema(),
+        "processed_tool_use_ids": processed_ids,
+        "tool_result_cache": result_cache, "retry": bool(retry)
     }
     try:
         Yaml.safe_atomic_write(REQUEST_PATH, request_payload)
@@ -545,8 +882,18 @@ def write_llm_request(
         raise IPCError(f"Failed to write request: {e}") from e
 
     run_state = {
-        "rnd": rnd, "tool_depth": tool_depth, "history": history,
+        "rnd": rnd, "tool_depth": tool_depth, "history": persist_window,
         "waiting_for": "llm_generate", "min_rounds": min_rounds,
+        "processed_tool_use_ids": processed_ids,
+        "tool_result_cache": result_cache,
+        # Carried, not recomputed: this function rebuilds the run state from an
+        # explicit key list, so anything a caller stashed in the in-memory dict
+        # (such as the lessons shown this round) would otherwise be silently
+        # dropped on every persist.
+        "applied_lessons": (
+            applied_lessons if applied_lessons is not None
+            else carried.get("applied_lessons") or []
+        ),
         "updated_at": time.time()
     }
     try:
@@ -571,15 +918,33 @@ def run_file_ipc(task: Optional[str], min_override: Optional[int]) -> None:
         min_rounds = _resolve_min_rounds(jinx, min_override)
         clean_up_ipc_files()
 
+        # Baseline the framework source before any tool call this round can
+        # modify it, and start from a fresh lesson-credit slate.
+        if selfpatch.SELF_PATCH_ENABLED:
+            selfpatch.capture_baseline()
+
+        run_state: Dict[str, Any] = {
+            "rnd": 1, "tool_depth": 0, "history": [],
+            "waiting_for": "llm_generate", "min_rounds": min_rounds,
+        }
+        lessons_text, applied = _inject_lessons(run_state)
+
         state_dump = Yaml.dump_to_string(jinx["state"])
-        user_msg = construct_round_prompt(rnd=1, min_rounds=min_rounds, state_dump=state_dump)
+        user_msg = construct_round_prompt(
+            rnd=1, min_rounds=min_rounds, state_dump=state_dump,
+            lessons_text=lessons_text,
+        )
         try:
-            write_llm_request([{"role": "user", "content": user_msg}], 1, 0, min_rounds)
+            write_llm_request(
+                [{"role": "user", "content": user_msg}], 1, 0, min_rounds,
+                applied_lessons=applied,
+            )
         except (IPCError, OSError, JinxError) as e:
             logger.error("Failed to write initial LLM request: %s", e, exc_info=True)
             clean_up_ipc_files()
             sys.exit(1)
         return
+
 
     # Resume path
     try:
@@ -686,16 +1051,69 @@ def _handle_llm_response(
     tool_blocks = [b for b in content_blocks if b.get("type") == "tool_use"]
     valid_calls: List[Dict[str, Any]] = []
     malformed_results: List[Dict[str, Any]] = []
+    refused_results: List[Dict[str, Any]] = []
 
     for b in tool_blocks:
         tool_use_id, name, params, err = _validate_tool_use_block(b)
         if err:
             malformed_results.append(err)
             continue
+        # Refuse a self-patch that would rewrite brake logic BEFORE dispatching
+        # it. Undo-after-the-fact is not good enough here: the model must be told
+        # it was refused, or it will keep re-attempting the same edit and read
+        # the failure as "verification is broken".
+        if name == "file_write" and isinstance(params, dict):
+            reason = selfpatch.guard_tool_call(
+                str(params.get("path") or ""), str(params.get("content") or "")
+            )
+            if reason:
+                logger.warning("Refused protected self-patch: %s", params.get("path"))
+                refused_results.append(
+                    {"type": "tool_result", "tool_use_id": tool_use_id, "content": reason}
+                )
+                continue
         valid_calls.append({"id": tool_use_id, "name": name, "params": params})
 
     if malformed_results:
         history.append({"role": "user", "content": malformed_results})
+
+    if refused_results:
+        # Paired refusals are delivered as a normal tool_result turn so the model
+        # stays in the tool-calling protocol instead of falling through to a
+        # state-block parse it did not intend.
+        history.append({"role": "user", "content": refused_results})
+        if not valid_calls:
+            # Every call was refused, but the loop still advanced: the model spent
+            # a turn. Counting it against the depth cap is what stops a model that
+            # keeps re-proposing the same forbidden write from spinning forever
+            # without ever reaching the cap that would break it out.
+            next_depth = tool_depth + 1
+            if next_depth >= TOOL_DEPTH_CAP:
+                logger.warning(
+                    "Tool depth limit reached while refusing self-patches. "
+                    "Forcing state recovery."
+                )
+                run_state["tool_depth"] = next_depth
+                history.append({
+                    "role": "user",
+                    "content": [{"type": "text", "text": TOOL_DEPTH_CRITICAL_MSG}],
+                })
+                try:
+                    _write_llm_request_no_tools(history, rnd, run_state)
+                except (IPCError, OSError, JinxError) as e:
+                    logger.error(
+                        "IPC failure after refusing a self-patch: %s", e, exc_info=True
+                    )
+                    clean_up_ipc_files()
+                    sys.exit(1)
+                return
+            try:
+                write_llm_request(history, rnd, next_depth, min_rounds)
+            except (IPCError, OSError, JinxError) as e:
+                logger.error("IPC failure after refusing a self-patch: %s", e, exc_info=True)
+                clean_up_ipc_files()
+                sys.exit(1)
+            return
 
     if valid_calls:
         try:
@@ -708,44 +1126,76 @@ def _handle_llm_response(
 
     # No tool calls — parse state block
     update = parse_state_block(full_text)
-    if update and isinstance(update.get("state"), dict):
-        flags = update["state"]
-    else:
-        flags = update or {}
     jinx = read_jinx()
+    diagnostics: List[str] = []
     if update:
-        jinx = merge_state(jinx, update)
+        outcome: Dict[str, Any] = {}
+        jinx = merge_state(jinx, update, diagnostics=diagnostics, outcome=outcome)
         write_jinx(jinx)
         # Re-resolve min_rounds so protocol changes from LLM take effect mid-session
         min_rounds = _resolve_min_rounds(jinx, None)
         scores = jinx["state"].get("scores", [])
 
-        if flags.get("exit_ready") and check_exit(scores, min_rounds, rnd):
-            print("[JINX_COMPLETE] Task resolved successfully!", flush=True)
-            clean_up_ipc_files()
-            return
+        # Honour exit/deadlock ONLY from state that actually passed validation. A
+        # rejected block must not be able to terminate the loop or claim success
+        # on the strength of scores the run state never accepted.
+        if outcome.get("applied"):
+            # Persist any NEW durable lessons to the cross-run ledger, and settle
+            # the credit for the lessons this round was actually shown. Both are
+            # best-effort: the learning store must never fail a round.
+            incoming = outcome.get("lessons") or []
+            if incoming:
+                try:
+                    ledger = learning.load_ledger()
+                    ledger["lessons"] = learning.add_lessons(
+                        ledger.get("lessons"), incoming
+                    )
+                    learning.save_ledger(ledger)
+                except Exception as e:
+                    logger.error("Could not persist lessons: %s", e, exc_info=True)
+            _close_lesson_bookkeeping(
+                run_state, bool(jinx["state"].get("scores", [{}])[-1].get("all_pass")
+                                if jinx["state"].get("scores") else False)
+            )
 
-        if flags.get("deadlock") or check_deadlock(scores, min_rounds, rnd):
-            if not flags.get("deadlock"):
-                jinx["state"]["deadlock"] = True
-                write_jinx(jinx)
-            print("[JINX_DEADLOCK] Loop aborted due to strategy deadlock.", flush=True)
-            clean_up_ipc_files()
-            return
+            flags = jinx["state"]
+            if flags.get("exit_ready") and check_exit(scores, min_rounds, rnd):
+                print("[JINX_COMPLETE] Task resolved successfully!", flush=True)
+                _finish_run()
+                return
+
+            if flags.get("deadlock") or check_deadlock(scores, min_rounds, rnd):
+                if not flags.get("deadlock"):
+                    jinx["state"]["deadlock"] = True
+                    write_jinx(jinx)
+                print("[JINX_DEADLOCK] Loop aborted due to strategy deadlock.", flush=True)
+                _finish_run()
+                return
+        else:
+            logger.warning(
+                "State block rejected; ignoring exit_ready/deadlock flags from the "
+                "rejected response and continuing to the next round."
+            )
 
     # Transition to next round
     rnd += 1
     if rnd >= HARD_CAP:
-        clean_up_ipc_files()
+        _finish_run()
         logger.error("Cognitive loop exhausted HARD_CAP.")
         sys.exit(2)
 
     jinx = read_jinx()
     state_dump = Yaml.dump_to_string(jinx.get("state") or {})
-    user_msg = construct_round_prompt(rnd=rnd, min_rounds=min_rounds, state_dump=state_dump, missing_state=not update)
+    lessons_text, applied = _inject_lessons(run_state)
+    user_msg = construct_round_prompt(
+        rnd=rnd, min_rounds=min_rounds, state_dump=state_dump,
+        missing_state=not update, lessons_text=lessons_text,
+    )
+    if diagnostics:
+        user_msg = user_msg + "\n" + "\n".join(diagnostics) + "\n"
     history.append({"role": "user", "content": user_msg})
     try:
-        write_llm_request(history, rnd, 0, min_rounds)
+        write_llm_request(history, rnd, 0, min_rounds, applied_lessons=applied)
     except (IPCError, OSError, JinxError) as e:
         logger.error("IPC failure while writing next LLM request: %s", e, exc_info=True)
         clean_up_ipc_files()
@@ -764,6 +1214,16 @@ def _handle_tool_response(
         for r in results
     ]
 
+    # The model may edit JINX's own source. That is allowed and sometimes the
+    # right move, but it must not be allowed to leave a broken framework behind,
+    # so verify-and-revert runs before the results are handed back for a new turn.
+    feedback = _enforce_self_patch_gate(run_state)
+    if feedback:
+        # Appended after the tool results, not before: the protocol requires every
+        # tool_result first, and the model should read the verdict as a
+        # conclusion on those results rather than as an instruction preceding them.
+        tool_results.append({"type": "text", "text": feedback})
+
     if tool_depth >= TOOL_DEPTH_CAP:
         logger.warning("Tool depth limit reached. Forcing state recovery.")
         tool_results.append({"type": "text", "text": TOOL_DEPTH_CRITICAL_MSG})
@@ -778,7 +1238,9 @@ def _handle_tool_response(
 
     history.append({"role": "user", "content": tool_results})
 
-    # Persist processed tool_use ids so stale-run retries can be recognized by the editor
+    # Persist processed ids AND the results themselves. Ids alone tell a host that
+    # a call ran but not what it produced, so a retry could only skip it and lose
+    # the output; with the cache the retry can be answered from memory.
     try:
         processed = run_state.get("processed_tool_use_ids", []) or []
         for r in results:
@@ -786,12 +1248,15 @@ def _handle_tool_response(
             if isinstance(tid, str) and tid not in processed:
                 processed.append(tid)
         run_state["processed_tool_use_ids"] = processed
+        run_state["tool_result_cache"] = _update_tool_result_cache(
+            run_state.get("tool_result_cache"), results
+        )
         try:
             Yaml.safe_atomic_write(RUN_STATE_PATH, run_state)
         except JinxError:
-            logger.warning("Failed to persist processed_tool_use_ids to run state.")
+            logger.warning("Failed to persist tool result cache to run state.")
     except Exception:
-        logger.debug("Unable to update processed_tool_use_ids in run_state.", exc_info=True)
+        logger.debug("Unable to update tool result cache in run_state.", exc_info=True)
 
     try:
         write_llm_request(history, rnd, tool_depth, min_rounds)
@@ -807,23 +1272,28 @@ def _write_tool_request(
     retry: bool = False
 ) -> None:
     """Writes a tool_calls request and updates run state."""
-    # Include existing processed tool_use ids and an optional retry marker so the
-    # editor can detect already-executed bash/file-write calls and return stored
-    # results instead of executing them again.
-    processed_ids: List[str] = []
-    try:
-        processed_ids = run_state.get("processed_tool_use_ids", []) or []
-    except Exception:
-        processed_ids = []
+    processed_ids: List[str] = run_state.get("processed_tool_use_ids", []) or []
+    result_cache: Dict[str, str] = _update_tool_result_cache(
+        run_state.get("tool_result_cache"), []
+    )
 
-    request_payload = {"type": "tool_calls", "calls": tool_calls, "processed_tool_use_ids": processed_ids, "retry": bool(retry)}
+    request_payload = {
+        "type": "tool_calls", "calls": tool_calls,
+        "processed_tool_use_ids": processed_ids,
+        "tool_result_cache": result_cache, "retry": bool(retry)
+    }
     try:
         Yaml.safe_atomic_write(REQUEST_PATH, request_payload)
     except JinxError as e:
         # Propagate as IPCError so callers can clean up IPC files.
         raise IPCError(f"Failed to write tool_calls request: {e}") from e
 
-    run_state.update({"tool_depth": tool_depth, "history": history, "waiting_for": "tool_calls", "updated_at": time.time()})
+    run_state.update({
+        "tool_depth": tool_depth,
+        "history": compact_history_for_request(history, HISTORY_PERSIST_WINDOW),
+        "waiting_for": "tool_calls", "updated_at": time.time(),
+        "tool_result_cache": result_cache,
+    })
     try:
         Yaml.safe_atomic_write(RUN_STATE_PATH, run_state)
     except JinxError as e:
@@ -845,7 +1315,11 @@ def _write_llm_request_no_tools(
     except JinxError as e:
         raise IPCError(f"Failed to write final summary request: {e}") from e
 
-    run_state.update({"waiting_for": "llm_generate", "history": history, "updated_at": time.time()})
+    run_state.update({
+        "waiting_for": "llm_generate",
+        "history": compact_history_for_request(history, HISTORY_PERSIST_WINDOW),
+        "updated_at": time.time()
+    })
     try:
         Yaml.safe_atomic_write(RUN_STATE_PATH, run_state)
     except JinxError as e:
@@ -923,16 +1397,24 @@ def run(task: Optional[str], min_override: Optional[int], ipc_mode: str = "file"
         update = parse_state_block(full_text)
         if update:
             last_round_missing_state = False
-            jinx = merge_state(jinx, update)
+            outcome: Dict[str, Any] = {}
+            jinx = merge_state(jinx, update, outcome=outcome)
             write_jinx(jinx)
             scores = jinx["state"].get("scores", [])
 
-            if update.get("exit_ready") and check_exit(scores, min_rounds, rnd):
+            # Same rule as the File-IPC path: a rejected block cannot terminate
+            # the loop. Its flags are ignored and the round continues.
+            if not outcome.get("applied"):
+                logger.warning("State block rejected in RPC mode; ignoring flags.")
+
+            if outcome.get("applied") and jinx["state"].get("exit_ready") \
+                    and check_exit(scores, min_rounds, rnd):
                 logger.info("Execution complete in round %d.", rnd)
                 break
-            if update.get("deadlock") or check_deadlock(scores, min_rounds, rnd):
+            if outcome.get("applied") and (jinx["state"].get("deadlock")
+                                           or check_deadlock(scores, min_rounds, rnd)):
                 logger.warning("Deadlock in round %d.", rnd)
-                if not update.get("deadlock"):
+                if not jinx["state"].get("deadlock"):
                     jinx["state"]["deadlock"] = True
                     write_jinx(jinx)
                 break
@@ -940,6 +1422,8 @@ def run(task: Optional[str], min_override: Optional[int], ipc_mode: str = "file"
             last_round_missing_state = True
     else:
         logger.error("HARD_CAP (%d rounds) exhausted.", HARD_CAP)
+        if selfpatch.SELF_PATCH_ENABLED:
+            selfpatch.clear_baseline()
         sys.exit(2)
 
 
@@ -948,6 +1432,15 @@ def _execute_rpc_tool(block: Dict[str, Any]) -> Dict[str, Any]:
     tool_use_id, name, params, err = _validate_tool_use_block(block)
     if err:
         return err
+    # Same brake-removal guard as the File-IPC path: a refused self-patch is
+    # never dispatched to the editor.
+    if name == "file_write" and isinstance(params, dict):
+        reason = selfpatch.guard_tool_call(
+            str(params.get("path") or ""), str(params.get("content") or "")
+        )
+        if reason:
+            logger.warning("Refused protected self-patch in RPC mode: %s", params.get("path"))
+            return {"type": "tool_result", "tool_use_id": tool_use_id, "content": reason}
     result_content, was_sliced, is_error = get_tool_result_from_editor(tool_use_id, name, params)
     if name == "file_read" and not is_error and not was_sliced:
         result_content = _slice_file_content(result_content, params)

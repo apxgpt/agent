@@ -30,12 +30,13 @@ You cannot finish on round 1 even if everything passes — at least 2 rounds of 
 STATE PERSISTENCE — READ CAREFULLY, THIS IS WHERE MOST FAILURES HAPPEN:
 Your state lives in JINX.yaml on disk. You MUST return an updated state block at the end of every response.
 
-- `scores` is your COMPLETE history, not just this round. Each round you must re-send EVERY prior round's
-  entry PLUS the new one appended. Sending only the current round's entry PERMANENTLY DELETES all earlier
-  rounds from disk — deadlock detection and exit criteria depend entirely on that full history.
-- `facts`, `debt`, and `open` follow the same rule: each is replaced wholesale by whatever you send. If you
-  have nothing new to add, repeat the full existing list from CURRENT STATE rather than omitting it or
-  sending a partial one.
+- `scores` is merged by round number, so you only need to send THIS round's entry. Any entry whose `round`
+  already exists replaces it; rounds you omit are preserved on disk. Deadlock detection and exit criteria
+  still see the complete history — they read it from disk, not from what you re-send. Re-sending older
+  rounds is still accepted and simply overwrites them, so never rely on it to keep history alive.
+- `facts`, `debt`, and `open` are different: each is REPLACED by whatever you send, so send the full list
+  from CURRENT STATE each round, not just new items. Near-duplicates are collapsed automatically and
+  `facts` is capped (oldest dropped first), so there is no benefit to padding it with restatements.
 - `requirements` keys (e.g. `req_name` below) must be the exact same strings every round for the same
   requirement. Renaming a requirement between rounds breaks deadlock clustering, which matches failures by
   literal key name.
@@ -59,9 +60,34 @@ it on rounds where you can't fill it out correctly.
 - `edges`: directed links between those nodes — `source` node ID, `target` node ID, and a `relation` label
   (e.g. 'reads', 'modifies', 'tests', 'depends_on').
 
+SELF-IMPROVEMENT — TWO SEPARATE THINGS, DON'T CONFUSE THEM:
+1. `lessons` (YOUR CALL, ALWAYS SAFE): send a `lessons` list in your state block to record a
+   durable rule distilled from what you actually observed this round. Unlike `facts`/`debt`/`open`,
+   lessons are ADDITIVE and survive into future tasks in a separate ledger, so a rule worth keeping
+   must be stated as a general, reusable imperative, not a note about this task. Examples:
+   "state blocks are validated as one unit, so never leave approach_graph half-filled",
+   "measure a notice against the same window you actually send, not the one you persist".
+   Send only NEW lessons; duplicates are collapsed automatically. Each round, the lessons you were
+   shown are credited or blamed by whether that round passed, so a rule that keeps failing stops
+   being shown. Do not pad this list — unproven rules start at zero credit and are dropped at the cap.
+2. Editing your own code under `.agent` (POWERFUL, GATED): you MAY edit `.agent/src/jinx/*.py` to
+   improve your own results, and that is a legitimate strategy. It is verified automatically: after
+   any round that touches framework source, the runner executes the full test suite. If anything
+   fails, your edit is REVERTED and you are told exactly what broke — you will not be left with a
+   silently broken framework. Rules:
+   - Always run the tests yourself before you consider such an edit finished.
+   - You may NOT redefine the brake logic: `merge_state`, `StateBlock`, `atomic_write_yaml`,
+     `_resolve_jinx_path` in state.py, or `check_exit`, `check_deadlock`, `_resolve_min_rounds`,
+     `_handle_llm_response` in runner.py. Writes that do are refused outright, and selfpatch.py and
+     learning.py are wholly off limits. These detect a broken framework; an agent that can rewrite
+     them cannot be verified by them.
+   - Prefer additive, backward-compatible changes. A change that makes the suite green by weakening
+     an assertion is worse than no change.
+
 REQUIRED — end every response with exactly one markdown YAML code block containing the updated state. The
 schema below shows the SHAPE of each field, not data to copy — replace every value with this task's real
-current state, and remember `scores`/`facts`/`debt`/`open` must each be the full list, not just new items:
+current state. Send only this round's `scores` entry; send `facts`/`debt`/`open` as the full list, and
+`lessons` as NEW entries only:
 
 FULL FORMAT (preferred for complex tasks with multiple requirements):
 ```yaml
@@ -87,6 +113,7 @@ state:
     all_pass: <true|false>
   debt: [<every shortcut taken so far, not just new ones>]
   open: [<every unresolved issue so far, not just new ones>]
+  lessons: [<only NEW durable rules learned this round, each a general imperative, not a task note>]
   exit_ready: <true|false — true only once all_pass is true on the latest round AND you are not still improving>
   deadlock: <true|false — true only if 3+ genuinely different approaches failed the same requirement>
 ```
@@ -100,23 +127,42 @@ MISSING_STATE_WARNING: str = (
     "WARNING: You did not output the REQUIRED markdown YAML state block (```yaml ... ```) at the end of your last response!\n"
     "You MUST output the updated state block with your final evaluation (including 'exit_ready: true' if the task is finished) "
     "so that JINX can parse it, update the state, and terminate cleanly. Do not skip this block!\n"
-    "Use CURRENT STATE below as your starting point — re-send the FULL 'scores' history (every prior round "
-    "plus this one), not just the latest entry, or earlier rounds will be permanently lost.\n\n"
+    "Use CURRENT STATE below as your starting point — send this round's 'scores' entry (the runner merges it "
+    "with the history already on disk by round number, so omitted rounds are kept).\n\n"
 )
 
 TOOL_DEPTH_CRITICAL_MSG: str = (
     "CRITICAL: The inner tool-calling depth limit has been reached. "
     "Do not call any more tools. You must immediately output your final thought "
     "and the exact, complete markdown YAML code block (```yaml ... ```) to persist your progress and avoid state loss.\n"
-    "Being cut off here does NOT mean the task is done — only set 'exit_ready: true' if the requirements "
+    "Being cut off here does not mean the task is done — only set 'exit_ready: true' if the requirements "
     "genuinely all passed. Otherwise set it false and describe what's left in 'open', so the next round can "
-    "continue from an honest state. Re-send the FULL 'scores' history (every prior round plus this one), "
-    "not just a summary of this round — this is the same rule as every other round."
+    "continue from an honest state. Send this round's 'scores' entry only — it is merged with the history "
+    "on disk by round number, so the earlier rounds are preserved without you re-sending them."
 )
 
+# Protection feedback prompts
+PROTECTED_FILE_REFUSAL: str = (
+    "your edit to JINX's own source modified a protected file (%s). "
+    "These files are off-limits to self-patching to prevent the agent from "
+    "disabling its own guardrails."
+)
+
+PROTECTED_SYMBOL_REFUSAL: str = (
+    "your edit to JINX's own source changed protected brake logic "
+    "in %s (%s). It was rolled back automatically and NOT verified: "
+    "these functions are what stop a self-patch from removing its own "
+    "safety checks, so no test result can justify changing them."
+)
+
+PROTECTION_CHECK_FAILURE: str = (
+    "the protected-logic check could not be completed (%s: %s), so this "
+    "edit was neither verified nor accepted"
+)
 
 def construct_round_prompt(
-    rnd: int, min_rounds: int, state_dump: str, missing_state: bool = False
+    rnd: int, min_rounds: int, state_dump: str, missing_state: bool = False,
+    lessons_text: str = "",
 ) -> str:
     """Constructs the structured user prompt for a specific execution round in the cognitive loop.
 
@@ -125,10 +171,16 @@ def construct_round_prompt(
         min_rounds (int): The minimum configured round threshold.
         state_dump (str): The serialized YAML or JSON string representing the current state block.
         missing_state (bool): If True, prepends the missing state block warning message.
+        lessons_text (str): Pre-rendered, already-bounded LEARNED RULES block from the
+            durable cross-run ledger. Passed in pre-rendered so the cost bound lives
+            in one place (``learning.render_lessons``) instead of being re-derived here.
 
     Returns:
         str: The fully-formed, formatted user prompt string for the cognitive loop.
     """
     warning_prefix = MISSING_STATE_WARNING if missing_state else ""
     round_label = f"ROUND {rnd} (at least {min_rounds} rounds required before exit is considered)"
-    return f"{warning_prefix}{round_label}\nCURRENT STATE:\n{state_dump}"
+    sections = [f"{warning_prefix}{round_label}\nCURRENT STATE:\n{state_dump}"]
+    if lessons_text:
+        sections.append(lessons_text)
+    return "\n\n".join(sections)
