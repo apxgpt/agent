@@ -15,6 +15,92 @@ src_path = Path(__file__).resolve().parent / "src"
 sys.path.insert(0, str(src_path))
 
 
+def _load_selfpatch():
+    """Loads ``selfpatch.py`` from its file, without importing the package first.
+
+    The module name must be package-qualified. ``selfpatch.py`` opens with
+    ``from . import prompts``, and loading it under a bare name leaves
+    ``__package__`` empty, so the import machinery raises "attempted relative
+    import with no known parent package". The caller treats a raised loader as
+    "nothing to repair", so a bare name silently disarmed the outermost brake
+    on every single run while the framework stayed free to patch itself.
+
+    Loading it still requires ``prompts.py`` to be importable, which is why
+    :func:`_restore_baseline_without_selfpatch` exists as a path that does not.
+
+    Returns the loaded module, or None when there is nothing to load.
+    """
+    import importlib.util
+
+    module_path = src_path / "jinx" / "selfpatch.py"
+    if not module_path.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location("jinx.selfpatch", module_path)
+    if spec is None or spec.loader is None:
+        return None
+    mod = importlib.util.module_from_spec(spec)
+    # Registered before exec so the relative import inside the module resolves
+    # against the real package rather than re-executing the file twice.
+    sys.modules[spec.name] = mod
+    try:
+        spec.loader.exec_module(mod)
+    except BaseException:
+        # The normal import machinery removes a module whose execution failed.
+        # Manual spec loading does not, so a half-built selfpatch would stay
+        # cached: BASELINE_DIR may be set while later definitions are missing,
+        # and the next import in this process would get that husk instead of
+        # re-executing a file the fallback path has since repaired. Leaving
+        # sys.modules clean is what lets recovery take effect at all.
+        sys.modules.pop(spec.name, None)
+        raise
+    return mod
+
+
+def _restore_baseline_without_selfpatch():
+    """Last-resort restore that imports nothing from the tree it repairs.
+
+    ``selfpatch.py`` opens with ``from . import prompts``, so loading it needs
+    ``prompts.py`` to be importable. A self-edit that put a syntax error into
+    ``prompts.py`` would therefore disarm the very brake meant to repair it --
+    the module meant to save the framework could not be loaded *because of* the
+    damage. This path closes that gap: it reads the baseline with the standard
+    library only and copies files back, so the recovery does not depend on any
+    module the model is allowed to edit.
+
+    Returns the names restored, or None when there is no baseline to restore.
+    """
+    import shutil
+
+    # src_path is .agent/src, so the baseline is its sibling and the sources
+    # live one level below it. Mirrors selfpatch.SRC_DIR / BASELINE_DIR.
+    baseline = src_path.parent / ".selfpatch_baseline"
+    src_dir = src_path / "jinx"
+    repo_root = src_path.parent.parent
+    if not baseline.is_dir():
+        return None
+
+    restored = []
+    for saved in sorted(baseline.rglob("*")):
+        if not saved.is_file():
+            continue
+        rel = saved.relative_to(baseline)
+        if rel.parts[0] == "repo":
+            target = repo_root / rel.relative_to("repo")
+        else:
+            target = src_dir / rel
+        try:
+            wanted = saved.read_text(encoding="utf-8")
+            if target.is_file() and target.read_text(encoding="utf-8") == wanted:
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(saved, target)
+            restored.append(str(rel).replace("\\", "/"))
+        except OSError as e:
+            print("[JINX SELF-PATCH] Could not restore %s: %s" % (rel, e),
+                  file=sys.stderr)
+    return restored
+
+
 def self_patch_preflight():
     """Revert a self-edit that broke the framework BEFORE importing it.
 
@@ -24,30 +110,43 @@ def self_patch_preflight():
     import could therefore never catch the exact failure it exists to prevent --
     it would be disarmed by the first self-patch bad enough to matter.
 
-    ``selfpatch.py`` deliberately imports nothing from the rest of the package, so
-    it is loaded here directly from its file, before and independently of the code
-    it protects. This is the outermost layer of the brake, and it is the only one
-    that still runs when the framework itself no longer imports.
+    ``selfpatch.py`` is loaded here directly from its file, before and
+    independently of the rest of the code it protects. This is the outermost
+    layer of the brake, and it is the only one that still runs when the
+    framework itself no longer imports.
 
     The baseline only exists once a run has started, so this is a no-op in the
     normal case and costs one stat() per source file.
     """
-    import importlib.util
     import os
 
     if os.environ.get("JINX_SELF_PATCH", "1") in ("0", "false", "False"):
         return
-    module_path = src_path / "jinx" / "selfpatch.py"
-    if not module_path.is_file():
-        return
     try:
-        spec = importlib.util.spec_from_file_location("_jinx_selfpatch", module_path)
-        if spec is None or spec.loader is None:
+        mod = _load_selfpatch()
+    except Exception as e:
+        # The brake itself will not load -- most likely because a self-edit
+        # broke a module it imports. Fall back to the stdlib-only restore
+        # instead of giving up, so the damage can still be rolled back.
+        print("[JINX SELF-PATCH] Preflight degraded (%s); using fallback restore"
+              % e, file=sys.stderr)
+        try:
+            restored = _restore_baseline_without_selfpatch()
+        except Exception as inner:
+            print("[JINX SELF-PATCH] Fallback restore unavailable: %s" % inner,
+                  file=sys.stderr)
             return
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-    except Exception as e:  # a corrupt selfpatch.py itself: nothing we can do here
-        print("[JINX SELF-PATCH] Preflight unavailable: %s" % e, file=sys.stderr)
+        if restored:
+            _record_feedback(
+                "[JINX SELF-PATCH REVERTED] JINX's own source could not be "
+                "loaded, so its safety checks could not run. The last verified "
+                "state was restored by the fallback path: %s."
+                % ", ".join(restored)
+            )
+            print("[JINX SELF-PATCH] Fallback restored: %s" % ", ".join(restored),
+                  file=sys.stderr)
+        return
+    if mod is None:
         return
 
     try:

@@ -36,20 +36,81 @@ app.use(express.json({ limit: "10mb" }));
 // BIND_HOST, so local development keeps working without extra setup.
 function requireAuth(req: express.Request, res: express.Response, next: express.NextFunction) {
   if (!API_TOKEN) return next();
-  const header = (req.headers.authorization || "").trim();
-  const scheme = "bearer ";
-  if (!header.toLowerCase().startsWith(scheme)) {
-    res.setHeader("WWW-Authenticate", 'Bearer realm="dashboard"'); return res.status(401).json({ error: "Unauthorized" });
-  }
-  const token = header.slice(scheme.length).trim();
-  if (!token || !timingSafeEqual(token, API_TOKEN)) {
+  if (!isAuthorized(req)) {
     res.setHeader("WWW-Authenticate", 'Bearer realm="dashboard"');
     return res.status(401).json({ error: "Unauthorized" });
   }
   next();
 }
 
+// Whether this request presented the configured token. With no token configured
+// there is nothing to present, so the answer stays false and the caller decides:
+// route access remains open, but the sensitive transcript fields stay redacted
+// unless the operator has deliberately configured a token.
+function isAuthorized(req: express.Request): boolean {
+  if (!API_TOKEN) return false;
+  const header = (req.headers.authorization || "").trim();
+  const scheme = "bearer ";
+  if (!header.toLowerCase().startsWith(scheme)) return false;
+  const token = header.slice(scheme.length).trim();
+  return !!token && timingSafeEqual(token, API_TOKEN);
+}
+
 const AGENT_MARKERS = ["JINX.yaml"];
+
+// The File-IPC handshake the runner and the host exchange, in the order a
+// transition uses them.
+const IPC_FILES = ["jinx_request.yaml", "jinx_response.yaml", "jinx_run_state.yaml"];
+
+// Cap on a file inlined into the payload. A long run's history grows with the
+// tool-result cache, so a hard skip made the most interesting files vanish
+// exactly when a session got busy; truncating keeps them visible.
+const MAX_INLINE_FILE_BYTES = 1024 * 1024;
+const TRUNCATION_NOTICE = "\n... [truncated by the dashboard at %d bytes] ...\n";
+
+// The runner deletes the IPC files between transitions, so a file that existed
+// at existsSync() can be gone by the time it is read. That is normal churn, not
+// a failure, and must not fail the whole snapshot.
+function isVanished(e: unknown): boolean {
+  const code = (e as NodeJS.ErrnoException)?.code;
+  return code === "ENOENT" || code === "ENOTDIR";
+}
+
+function readCapped(filepath: string): string {
+  const stat = fs.statSync(filepath);
+  if (stat.size < MAX_INLINE_FILE_BYTES) {
+    return fs.readFileSync(filepath, "utf8");
+  }
+  const buf = Buffer.alloc(MAX_INLINE_FILE_BYTES);
+  const fd = fs.openSync(filepath, "r");
+  try {
+    fs.readSync(fd, buf, 0, MAX_INLINE_FILE_BYTES, 0);
+  } finally {
+    fs.closeSync(fd);
+  }
+  return buf.toString("utf8") + TRUNCATION_NOTICE.replace("%d", String(stat.size));
+}
+
+// Every .py under a directory, as paths relative to it, skipping caches.
+function collectSourceFiles(root: string, prefix = ""): string[] {
+  const out: string[] = [];
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(root, { withFileTypes: true });
+  } catch {
+    return out;
+  }
+  for (const entry of entries) {
+    if (entry.name === "__pycache__" || entry.name.startsWith(".")) continue;
+    const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+    if (entry.isDirectory()) {
+      out.push(...collectSourceFiles(path.join(root, entry.name), rel));
+    } else if (entry.isFile() && entry.name.endsWith(".py")) {
+      out.push(rel);
+    }
+  }
+  return out.sort();
+}
 
 function findAgentDir(): string | null {
   const pathsToTry = [
@@ -148,7 +209,7 @@ app.get("/api/auth-check", (req, res) => {
 });
 
 // Core data-fetching function shared by the REST endpoint and SSE stream.
-function getLiveSessionData() {
+function getLiveSessionData(authorized = false) {
   const agentDir = findAgentDir();
 
   if (!agentDir) {
@@ -182,19 +243,53 @@ function getLiveSessionData() {
     try {
       const stat = fs.statSync(filepath);
       if (stat.isFile()) {
-        if (stat.size < 1024 * 1024) {
+        // The IPC files are handled below, presence-only. They must be skipped
+        // here too, not just overwritten afterwards: a sub-megabyte
+        // jinx_request.yaml otherwise takes this branch and is published whole.
+        if (!IPC_FILES.includes(file) && stat.size < MAX_INLINE_FILE_BYTES) {
           files[file] = fs.readFileSync(filepath, "utf8");
         }
       } else if (stat.isDirectory() && file === "src") {
-        const srcFiles = fs.readdirSync(filepath);
-        for (const sf of srcFiles) {
-          const sfp = path.join(filepath, sf);
-          if (fs.statSync(sfp).isFile() && sf.endsWith(".py")) {
-            files[`src/${sf}`] = fs.readFileSync(sfp, "utf8");
-          }
+        // Walk recursively. The real layout is src/jinx/*.py, so a single-level
+        // scan that keeps only files found directly in src/ matches nothing and
+        // silently hides the whole framework.
+        for (const rel of collectSourceFiles(filepath)) {
+          // Same cap as every other entry: a large .py would otherwise inflate
+          // every single /api/live-session response and be re-shipped on each poll.
+          // A read error unrelated to the file disappearing keeps the previous
+          // behaviour: the entry is simply absent.
+          try {
+            files[`src/${rel}`] = readCapped(path.join(filepath, rel));
+          } catch (e) {}
         }
       }
     } catch (e) {}
+  }
+
+  // The File-IPC handshake files are the live state of a run, and they only
+  // exist while a transition is outstanding: the runner deletes them on success,
+  // deadlock and cleanup. Listing them unconditionally keeps the panel stable
+  // and makes the current phase readable, instead of entries appearing and
+  // vanishing underneath the user between polls.
+  //
+  // Their *contents* are deliberately not published. jinx_request.yaml holds the
+  // full message history, tool call parameters and the tool_result_cache;
+  // jinx_run_state.yaml holds history and tool results. /api/live-session is
+  // reachable without a token whenever DASHBOARD_BIND_HOST opts into network
+  // access, so serving those bytes would hand any client on the network the
+  // task text, file contents and tool arguments. Presence is the part the panel
+  // actually needs to explain the phase.
+  for (const name of IPC_FILES) {
+    if (name in files) continue;
+    const fp = path.join(agentDir, name);
+    try {
+      const stat = fs.statSync(fp);
+      files[name] = `(present — ${stat.size} bytes, contents withheld)`;
+    } catch (e) {
+      files[name] = isVanished(e)
+        ? "(not present — no transition is currently outstanding)"
+        : "(unreadable)";
+    }
   }
 
   // Check for JINX-native agent first
@@ -416,9 +511,11 @@ function getLiveSessionData() {
           os: process.platform,
         },
         plan,
-        thoughts,
-        rpcLog,
-        terminalLog,
+        ...redactUnlessAuthorized(authorized),
+        ...(authorized ? { thoughts, rpcLog, terminalLog } : {}),
+        // `files` is filtered inside getLiveSessionData: the IPC files are
+        // reported presence-only regardless of authorization, because the raw
+        // bytes are the sensitive part and the panel does not need them.
         diffs,
         diffsError,
         files,
@@ -437,10 +534,32 @@ function getLiveSessionData() {
   };
 }
 
+// The thoughts/rpcLog/terminalLog fields are built from the run state's
+// `history`, which carries the model's message text, the parameters of every
+// tool call and the full content of every tool result -- including the contents
+// of whatever files the agent read. requireAuth is a no-op unless
+// DASHBOARD_API_TOKEN is set, and DASHBOARD_BIND_HOST alone puts the server on
+// the network, so publishing those fields to an unauthenticated client hands a
+// remote caller the task text and any file the run has touched.
+//
+// Withholding them is the safe default: the panel still shows the phase, the
+// plan, the round scores and the file list, so it stays useful. Set
+// DASHBOARD_API_TOKEN to opt back in to the full transcript. The `files` map
+// is filtered separately, further down, for the same reason.
+function redactUnlessAuthorized(verified: boolean) {
+  if (verified) return {};
+  return {
+    thoughts: [],
+    rpcLog: [],
+    terminalLog: [],
+    transcriptRedacted: true,
+  };
+}
+
 // REST endpoint — returns a snapshot of the current live session.
 app.get("/api/live-session", requireAuth, (req, res) => {
   try {
-    const data = getLiveSessionData();
+    const data = getLiveSessionData(isAuthorized(req));
     res.json(data);
   } catch (error: any) {
     const message = error?.message || (error ? String(error) : "Failed to load live agent session");
@@ -462,7 +581,7 @@ app.get("/api/live-session/stream", requireAuth, (req, res) => {
 
   const send = () => {
     try {
-      const data = getLiveSessionData();
+      const data = getLiveSessionData(isAuthorized(req));
       res.write(`data: ${JSON.stringify(data)}\n\n`);
     } catch (e) {
       res.write(`data: ${JSON.stringify({ exists: false, message: String(e) })}\n\n`);
