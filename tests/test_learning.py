@@ -1424,11 +1424,8 @@ class TestBootstrapPreflightCanActuallyLoadTheBrake:
             "BASELINE_DIR = None\n",
             encoding="utf-8",
         )
-        sys.modules["missing_dependency_for_test"] = None
-        monkeypatch.setitem(sys.modules, "missing_dependency_for_test", None)
-
         purge()
-        with pytest.raises(Exception):
+        with pytest.raises(ImportError):
             loader()
 
         assert "jinx.selfpatch" not in sys.modules, (
