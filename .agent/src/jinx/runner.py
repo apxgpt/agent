@@ -687,7 +687,10 @@ def _render_check_failures(checks: List[Dict[str, Any]]) -> str:
             )
         if tail.strip():
             lines.append("[%s] raw tail (untruncated evidence):" % name)
-            lines.append(_elide_tail(tail))
+            if digest:
+                lines.append(_elide_tail(tail))
+            else:
+                lines.append(tail)
     if not lines:
         lines.append(prompts.CHECK_FAILURE_LINE % ("?", "verification failed with no output"))
     return "\n".join(lines)

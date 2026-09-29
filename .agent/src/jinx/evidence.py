@@ -25,11 +25,10 @@ _FAILURE_RE = re.compile(
 )
 
 # "4 failed, 205 passed, 2 skipped in 8.67s"
+# "1 warning, 1 error, 1 failed" and similar pytest summaries can list the same
+# outcomes in any order, and the final tally may omit a failed line entirely.
 _COUNTS_RE = re.compile(
-    r"(?P<failed>\d+)\s+failed"
-    r"(?:,\s*(?P<passed>\d+)\s+passed)?"
-    r"(?:,\s*(?P<skipped>\d+)\s+skipped)?"
-    r"(?:,\s*(?P<errors>\d+)\s+error)?"
+    r"(?P<count>\d+)\s+(?P<kind>failed|passed|skipped|error|errors|warning|warnings)"
 )
 
 # Values that differ between two runs of the same failure and would otherwise
@@ -112,12 +111,20 @@ def parse_failures(
             failures.append((match.group("nodeid"), match.group("reason") or ""))
             continue
         counts_match = _COUNTS_RE.search(line)
-        if counts_match and "failed" in line:
+        if counts_match:
             saw_summary = True
-            for key in ("failed", "passed", "skipped", "errors"):
-                value = counts_match.group(key)
-                if value is not None:
-                    counts[key] = int(value)
+            for count_match in _COUNTS_RE.finditer(line):
+                kind = count_match.group("kind")
+                key = {
+                    "failed": "failed",
+                    "passed": "passed",
+                    "skipped": "skipped",
+                    "error": "errors",
+                    "errors": "errors",
+                    "warning": "warnings",
+                    "warnings": "warnings",
+                }[kind]
+                counts[key] = int(count_match.group("count"))
             continue
         if line.startswith(("E ", "E\t")) or "Error" in line or "assert" in line.lower():
             unparsed.append(line)
@@ -152,7 +159,7 @@ def parse_failures(
         # A tail that reports failures the parser never saw is evidence of a
         # different problem than a clean run, and the difference decides whether
         # the model can trust this report.
-        "undercounted": bool(counts.get("failed")) and len(failures) < counts["failed"],
+        "undercounted": bool(reported) and len(failures) < reported,
         "unparsed": unparsed[:max_examples],
     }
 
@@ -226,5 +233,9 @@ def evidence_from_check(
     if digest:
         return digest
     if not check.get("ok"):
+        if tail:
+            return "TEST EVIDENCE: %s failed but produced no parseable failure line.\n%s" % (
+                check.get("name"), tail
+            )
         return "TEST EVIDENCE: %s failed but produced no parseable failure line." % check.get("name")
     return None
