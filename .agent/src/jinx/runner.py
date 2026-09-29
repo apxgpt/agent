@@ -33,7 +33,7 @@ from . import prompts
 from .prompts import SYSTEM_PROMPT, TOOL_DEPTH_CRITICAL_MSG, construct_round_prompt
 from .state import merge_state, read_jinx, write_jinx
 from .tools import tool_schema
-from . import learning, selfpatch
+from . import evidence, learning, selfpatch
 
 logger = logging.getLogger("jinx.runner")
 
@@ -434,13 +434,23 @@ def _signal_cleanup(signum=None, frame=None) -> None:
         pass
 
 
-for sig in ("SIGINT", "SIGTERM", "SIGHUP"):
-    try:
-        signum = getattr(signal, sig)
-        signal.signal(signum, _signal_cleanup)
-    except (AttributeError, OSError, RuntimeError):
-        # Some signals may not be available on all platforms (e.g., SIGHUP on Windows)
-        continue
+def _install_signal_handlers() -> None:
+    """Installs the IPC cleanup handlers for the signals a run can receive.
+
+    Registration is deliberately deferred to the run entry points instead of
+    happening at import time. This module is imported by test runners, editor
+    integrations and lint tooling, and the handler ends the process with
+    ``os._exit`` while deleting the IPC files. Installed on import, it silently
+    disarmed Ctrl+C in every one of those processes and removed files they had
+    no business removing; the agent is supposed to be stopped, not to vanish.
+    """
+    for sig in ("SIGINT", "SIGTERM", "SIGHUP"):
+        try:
+            signum = getattr(signal, sig)
+            signal.signal(signum, _signal_cleanup)
+        except (AttributeError, OSError, RuntimeError):
+            # Some signals may not be available on all platforms (e.g., SIGHUP on Windows)
+            continue
 
 
 def _resolve_min_rounds(jinx: Dict[str, Any], min_override: Optional[int]) -> int:
@@ -622,12 +632,68 @@ def _enforce_self_patch_gate(run_state: Dict[str, Any]) -> Optional[str]:
     revert_notice = prompts.SELF_PATCH_REVERTED % (
         ", ".join(changed),
         result["summary"],
-        "\n".join(
-            prompts.CHECK_FAILURE_LINE % (c["name"], c["tail"])
-            for c in result["checks"]
-        ),
+        _render_check_failures(result["checks"]),
     )
     return _rollback_and_report(revert_notice)
+
+
+DEFAULT_RAW_TAIL_LINES: int = 12
+
+
+def _elide_tail(tail: str, max_lines: int = DEFAULT_RAW_TAIL_LINES) -> str:
+    """Shortens a captured tail to its head and tail, marking what was dropped.
+
+    The tail arrives already truncated to 25 lines from the end, so the head is
+    where the traceback detail lives. Keeping the first and last few lines and
+    eliding the middle bounds the notice while preserving both the traceback and
+    the summary line that identifies the failures.
+    """
+    lines = [evidence.strip_noise(l) for l in tail.rstrip().splitlines()]
+    lines = [l for l in lines if l.strip()]
+    if len(lines) <= max_lines:
+        return "\n".join(lines)
+    head = max(1, max_lines // 2)
+    tail_lines = max(1, max_lines - head)
+    dropped = len(lines) - head - tail_lines
+    middle = ["... %d line(s) elided by JINX to fit the budget ..." % dropped]
+    return "\n".join(lines[:head] + middle + lines[-tail_lines:])
+
+
+def _render_check_failures(checks: List[Dict[str, Any]]) -> str:
+    """Renders failed checks grouped by cause instead of as raw tails.
+
+    A tail is a symptom list capped at 25 lines and truncated from the start, so
+    one broken helper arrives as dozens of near-identical lines with the common
+    cause out of view. Grouping collapses that to the file, the cause and how
+    many tests share it.
+
+    A bounded, elided tail is still kept underneath: grouping infers a cause from
+    message text, and keeping the original lets the model check that inference
+    instead of trusting it. It is elided rather than pasted whole because the
+    grouping already covers what the repetition was used for.
+    """
+    lines: List[str] = []
+    for check in checks:
+        if check.get("ok"):
+            continue
+        name = str(check.get("name") or "?")
+        tail = str(check.get("tail") or "")
+        digest = evidence.evidence_from_check(check)
+        if digest:
+            lines.append(digest)
+        else:
+            lines.append(
+                prompts.CHECK_FAILURE_LINE % (name, tail or "(no output captured)")
+            )
+        if tail.strip():
+            lines.append("[%s] raw tail (untruncated evidence):" % name)
+            if digest:
+                lines.append(_elide_tail(tail))
+            else:
+                lines.append(tail)
+    if not lines:
+        lines.append(prompts.CHECK_FAILURE_LINE % ("?", "verification failed with no output"))
+    return "\n".join(lines)
 
 
 def _finish_run() -> None:
@@ -895,6 +961,7 @@ def write_llm_request(
 
 def run_file_ipc(task: Optional[str], min_override: Optional[int]) -> None:
     """Orchestrates JINX loop using a stateless File-based IPC protocol."""
+    _install_signal_handlers()
     is_resuming = RUN_STATE_PATH.exists() and not task
 
     if not is_resuming:
@@ -1319,6 +1386,7 @@ def _write_llm_request_no_tools(
 
 def run(task: Optional[str], min_override: Optional[int], ipc_mode: str = "file") -> None:
     """Orchestrates the JINX execution loop."""
+    _install_signal_handlers()
     if ipc_mode == "file":
         run_file_ipc(task, min_override)
         return

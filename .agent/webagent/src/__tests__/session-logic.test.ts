@@ -336,7 +336,10 @@ describe("history list invariant across consecutive runs and reloads", () => {
       assertNoDuplicates(state.sessions);
     }
 
-    // Two distinct runs, two entries - not four.
-    expect(state.sessions.map((s) => s.id).sort()).toEqual(["completed-1000", "error-1000"]);
+    // Two distinct runs, two archived entries plus the idle live slot.
+    expect(state.sessions.map((s) => s.id).sort()).toEqual(["completed-1001", "error-1002", "live-session"]);
+    expect(state.sessions.filter((s) => s.terminalKey).length).toBe(2);
+    expect(state.sessions.filter((s) => s.terminalKey === "live-session:completed")).toHaveLength(1);
+    expect(state.sessions.filter((s) => s.terminalKey === "live-session-1:error")).toHaveLength(1);
   });
 });

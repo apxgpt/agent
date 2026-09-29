@@ -66,6 +66,8 @@ const IPC_FILES = ["jinx_request.yaml", "jinx_response.yaml", "jinx_run_state.ya
 // tool-result cache, so a hard skip made the most interesting files vanish
 // exactly when a session got busy; truncating keeps them visible.
 const MAX_INLINE_FILE_BYTES = 1024 * 1024;
+const MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024;
+const MAX_SNAPSHOT_FILES = 200;
 const TRUNCATION_NOTICE = "\n... [truncated by the dashboard at %d bytes] ...\n";
 
 // The runner deletes the IPC files between transitions, so a file that existed
@@ -234,6 +236,8 @@ function getLiveSessionData(authorized = false) {
   }
 
   const files: Record<string, string> = {};
+  let snapshotBytes = 0;
+  let snapshotFiles = 0;
 
   // Read top-level .agent files
   const dirFiles = fs.readdirSync(agentDir);
@@ -246,21 +250,40 @@ function getLiveSessionData(authorized = false) {
         // The IPC files are handled below, presence-only. They must be skipped
         // here too, not just overwritten afterwards: a sub-megabyte
         // jinx_request.yaml otherwise takes this branch and is published whole.
-        if (!IPC_FILES.includes(file) && stat.size < MAX_INLINE_FILE_BYTES) {
-          files[file] = fs.readFileSync(filepath, "utf8");
+        if (IPC_FILES.includes(file)) continue;
+        if (snapshotFiles >= MAX_SNAPSHOT_FILES || snapshotBytes >= MAX_SNAPSHOT_BYTES) break;
+        try {
+          const contents = stat.size < MAX_INLINE_FILE_BYTES ? fs.readFileSync(filepath, "utf8") : readCapped(filepath);
+          const size = Buffer.byteLength(contents, "utf8");
+          if (snapshotBytes + size > MAX_SNAPSHOT_BYTES || snapshotFiles + 1 > MAX_SNAPSHOT_FILES) break;
+          files[file] = contents;
+          snapshotBytes += size;
+          snapshotFiles += 1;
+        } catch (e) {
+          if (isVanished(e)) {
+            files[file] = "(not present — file removed while reading)";
+          }
         }
       } else if (stat.isDirectory() && file === "src") {
         // Walk recursively. The real layout is src/jinx/*.py, so a single-level
         // scan that keeps only files found directly in src/ matches nothing and
         // silently hides the whole framework.
         for (const rel of collectSourceFiles(filepath)) {
-          // Same cap as every other entry: a large .py would otherwise inflate
-          // every single /api/live-session response and be re-shipped on each poll.
-          // A read error unrelated to the file disappearing keeps the previous
-          // behaviour: the entry is simply absent.
+          const key = `src/${rel}`;
+          if (snapshotFiles >= MAX_SNAPSHOT_FILES || snapshotBytes >= MAX_SNAPSHOT_BYTES) break;
+          const fp = path.join(filepath, rel);
           try {
-            files[`src/${rel}`] = readCapped(path.join(filepath, rel));
-          } catch (e) {}
+            const contents = readCapped(fp);
+            const size = Buffer.byteLength(contents, "utf8");
+            if (snapshotBytes + size > MAX_SNAPSHOT_BYTES || snapshotFiles + 1 > MAX_SNAPSHOT_FILES) break;
+            files[key] = contents;
+            snapshotBytes += size;
+            snapshotFiles += 1;
+          } catch (e) {
+            if (isVanished(e)) {
+              files[key] = "(not present — file removed while reading)";
+            }
+          }
         }
       }
     } catch (e) {}
