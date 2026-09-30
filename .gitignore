@@ -37,6 +37,9 @@ dist/
 *.sln
 *.swp
 
+# --- CodeGraph local index ---
+.codegraph/
+
 # --- OS System Files ---
 .DS_Store
 Thumbs.db
