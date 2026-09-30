@@ -680,19 +680,18 @@ def _plan_candidates(text: Any) -> List[str]:
             continue
 
         suffix = next((s for s in PLAN_PATH_SUFFIXES if token.lower().endswith(s)), "")
-        has_separator = "/" in token or "\\" in token
-        first_dir = ""
-        if has_separator:
-            first_dir = token.split("/", 1)[0].split("\\", 1)[0]
-        if has_separator:
-            dir_exists = bool(first_dir and any((root / first_dir).exists() for root in roots))
-            if not suffix and not dir_exists:
+        has_known_suffix = bool(suffix and len(token) > len(suffix))
+        has_path_separator = "/" in token or "\\" in token
+
+        if not has_known_suffix:
+            if not has_path_separator:
                 continue
-        else:
-            # A bare suffix is not a file name. "notes.md" is a path this loop can
-            # check; ".md" is what a stripped glob left behind.
-            if not suffix or len(token) <= len(suffix):
+            first = re.split(r"[/\\]", token, maxsplit=1)[0]
+            if not first:
                 continue
+            if not any((root / first).is_dir() for root in roots):
+                continue
+
         seen.add(token)
         found.append(token)
         if len(found) >= PLAN_MAX_PATHS:

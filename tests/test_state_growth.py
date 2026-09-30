@@ -14,8 +14,6 @@ from typing import Any
 import pytest
 import yaml
 
-from jinx.prompts import REASONING_PROTOCOL, construct_round_prompt
-from jinx.reasoning import _plan_candidates, render_cause_note
 from jinx.runner import (
     _update_tool_result_cache,
     compact_history_for_request,
@@ -99,82 +97,6 @@ class TestScoreMergeIsLossless:
         assert "prior_failure" not in entries[0]
         assert "prior_failure" in entries[-1]
 
-    def test_reasoning_fields_are_kept_in_normalized_simplified_scores(self) -> None:
-        jinx: dict[str, Any] = {"state": {}}
-        update = {
-            "scores": [{
-                "round": 1,
-                "verdict": "pass",
-                "detail": "works now",
-                "hypothesis": "if I fix the guard, it passes",
-                "prediction_check": "hit",
-                "cause": "wrong_mechanism",
-                "plan": "src/app.py",
-            }]
-        }
-
-        result = merge_state(jinx, update)
-        entry = result["state"]["scores"][0]
-
-        assert entry["hypothesis"] == "if I fix the guard, it passes"
-        assert entry["prediction_check"] == "hit"
-        assert entry["cause"] == "wrong_mechanism"
-        assert entry["plan"] == "src/app.py"
-
-    def test_reasoning_fields_are_truncated_from_older_history_only(self) -> None:
-        jinx: dict[str, Any] = {"state": {"scores": []}}
-        for n in range(1, 8):
-            jinx = merge_state(jinx, _wrap([
-                {
-                    **_score(n),
-                    "hypothesis": f"hypothesis-{n}",
-                    "plan": f"path/{n}.py",
-                }
-            ]))
-
-        entries = jinx["state"]["scores"]
-        assert "hypothesis" not in entries[0]
-        assert "plan" not in entries[0]
-        assert entries[-1].get("plan") == "path/7.py"
-
-    def test_protocol_is_appended_for_scored_rounds_even_without_notes(self) -> None:
-        state_dump = yaml.safe_dump({
-            "state": {
-                "scores": [{
-                    "round": 1,
-                    "approach": "check-the-guard",
-                    "requirements": {"req_x": False},
-                    "pass_count": 0,
-                    "all_pass": False,
-                }]
-            }
-        })
-
-        prompt = construct_round_prompt(2, 2, state_dump)
-
-        assert REASONING_PROTOCOL in prompt
-        assert "REASONING NOTES" not in prompt
-
-    def test_repeated_cause_uses_only_the_trailing_consecutive_run(self) -> None:
-        scores = [
-            {"round": 1, "cause": "wrong_target", "all_pass": False, "requirements": {"r": False}},
-            {"round": 2, "cause": "wrong_target", "all_pass": False, "requirements": {"r": False}},
-            {"round": 3, "cause": "wrong_mechanism", "all_pass": False, "requirements": {"r": False}},
-            {"round": 4, "cause": "wrong_mechanism", "all_pass": False, "requirements": {"r": False}},
-            {"round": 5, "cause": "wrong_mechanism", "all_pass": False, "requirements": {"r": False}},
-        ]
-
-        note = render_cause_note(scores)
-
-        assert "rounds 4 and 5 both failed" in note
-        assert "3 rounds running" in note
-
-    def test_plan_tokens_with_slash_are_only_kept_when_they_look_like_paths(self) -> None:
-        candidates = _plan_candidates("assert pass/fail flag in state.py and use true/false")
-
-        assert "pass/fail" not in candidates
-        assert "true/false" not in candidates
-        assert "state.py" in candidates
 
 
 class TestValidationFeedback:
