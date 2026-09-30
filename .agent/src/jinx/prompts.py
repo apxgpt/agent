@@ -704,9 +704,8 @@ def construct_round_prompt(
         state_dump, REASONING_NOTES_HEADER, min_rounds=min_rounds, rnd=rnd,
     )
     if notes:
-        # Only when there is a score history to reason about. Round 1 has none,
-        # and an empty note block would cost tokens without informing anything.
         sections.append(notes)
+    if reasoning.scores_from_dump(state_dump):
         sections.append(REASONING_PROTOCOL)
     if lessons_text:
         sections.append(lessons_text)

@@ -228,6 +228,10 @@ def _normalize_score_entry(entry: Any) -> Dict[str, Any]:
             normalized["prior_failure"] = entry["prior_failure"]
         if entry.get("approach_graph"):
             normalized["approach_graph"] = entry["approach_graph"]
+        for field in ("hypothesis", "prediction_check", "cause", "plan"):
+            value = entry.get(field)
+            if value is not None and str(value).strip():
+                normalized[field] = value
         return normalized
 
     return entry
@@ -432,6 +436,8 @@ def merge_state(
         for entry in s["scores"][:-5]:
             if isinstance(entry, dict):
                 entry.pop("prior_failure", None)
+                entry.pop("hypothesis", None)
+                entry.pop("plan", None)
 
     if "exit_ready" in update:
         s["exit_ready"] = validated_block.exit_ready

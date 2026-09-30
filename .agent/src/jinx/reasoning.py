@@ -393,19 +393,37 @@ def render_cause_note(scores: List[Any]) -> str:
     is the one place the class of the mistake is recorded, so the same label in
     two consecutive failing rounds is the signal that the class did not change.
     """
-    labelled = [e for e in scores or [] if cause_label(_val(e, "cause"))]
-    if len(labelled) < 2:
+    history = scores or []
+    if len(history) < 2:
         return ""
-    pair = labelled[-2:]
+
+    trail: List[Any] = []
+    last_label = None
+    for entry in reversed(history):
+        label = cause_label(_val(entry, "cause"))
+        if not label:
+            break
+        if last_label is None:
+            last_label = label
+            trail.append(entry)
+            continue
+        if label != last_label:
+            break
+        trail.append(entry)
+    if len(trail) < 2:
+        return ""
+
+    run = list(reversed(trail))
+    pair = run[-2:]
     if any(_val(e, "all_pass", False) for e in pair):
         return ""
     label = cause_label(_val(pair[-1], "cause"))
-    if cause_label(_val(pair[0], "cause")) != label:
+    if not label or cause_label(_val(pair[0], "cause")) != label:
         return ""
     text = _prompts()
     if text is None:
         return ""
-    repeats = sum(1 for e in labelled if cause_label(_val(e, "cause")) == label)
+    repeats = len(run)
     return text.note_repeated_cause(
         " and ".join(str(_val(e, "round", "?")) for e in pair), label, repeats
     )
@@ -644,6 +662,7 @@ def _plan_candidates(text: Any) -> List[str]:
     # candidates "src" and ".py" and be reported as two missing files.
     body = re.sub(r"[A-Za-z][A-Za-z0-9+.-]*://\S*", " ", body)
     body = re.sub(r"[\w.\\/]*[*?][\w.\\/*?]*", " ", body)
+    roots = _probe_roots()
     found: List[str] = []
     seen: Set[str] = set()
     for raw in re.findall(r"[A-Za-z0-9_./\\-]+", body):
@@ -659,10 +678,17 @@ def _plan_candidates(text: Any) -> List[str]:
             continue
         if raw[0] in "/\\" or re.match(r"^[A-Za-z]:", raw):
             continue
-        if "/" in raw or "\\" in raw:
-            pass
+
+        suffix = next((s for s in PLAN_PATH_SUFFIXES if token.lower().endswith(s)), "")
+        has_separator = "/" in token or "\\" in token
+        first_dir = ""
+        if has_separator:
+            first_dir = token.split("/", 1)[0].split("\\", 1)[0]
+        if has_separator:
+            dir_exists = bool(first_dir and any((root / first_dir).exists() for root in roots))
+            if not suffix and not dir_exists:
+                continue
         else:
-            suffix = next((s for s in PLAN_PATH_SUFFIXES if token.lower().endswith(s)), "")
             # A bare suffix is not a file name. "notes.md" is a path this loop can
             # check; ".md" is what a stripped glob left behind.
             if not suffix or len(token) <= len(suffix):
