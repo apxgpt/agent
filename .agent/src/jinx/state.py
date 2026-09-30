@@ -136,6 +136,15 @@ class ScoreEntry(BaseModel):
     pass_count: int = 0
     all_pass: bool = False
     approach_graph: Optional[ApproachGraph] = None
+    # Optional reasoning fields. The state keeps only pass/fail per requirement,
+    # so a wrong belief and a wrong implementation look identical after the fact.
+    # These make the round's reasoning checkable: what it predicted, whether the
+    # prediction held, which class of failure it hit, and the plan it ran. All
+    # optional, so a state file written before they existed still validates.
+    hypothesis: Optional[str] = None
+    prediction_check: Optional[str] = None
+    cause: Optional[str] = None
+    plan: Optional[str] = None
     # Simplified format fields (optional, auto-converted)
     verdict: Optional[str] = None
     detail: Optional[str] = None

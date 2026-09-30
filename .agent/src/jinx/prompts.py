@@ -33,7 +33,9 @@ rather than by convention:
   at all. See ``selfpatch.PROTECTED_FILES``.
 """
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
+
+from . import reasoning
 
 
 SYSTEM_PROMPT: str = """You are JINX, a single-agent cognitive loop. You execute tasks through disciplined iterative refinement.
@@ -248,6 +250,34 @@ INVALID_TOOL_BLOCK_INPUT_MSG: str = "Error: Malformed tool_use block (input must
 
 FILE_SLICE_FAILURE_MSG: str = "Error: Failed to slice file content: %s"
 
+REASONING_NOTES_HEADER: str = (
+    "REASONING NOTES (computed from the score history above, not from this round):"
+)
+
+# Why the four optional fields below exist. The loop protocol already demands
+# structural deduction between rounds, but the state it persists keeps only a
+# pass/fail flag per requirement, so a wrong belief about the code and a clumsy
+# implementation of a correct idea are indistinguishable once the round is over.
+# These two blocks are the editable half of that contract: the protocol says what
+# to reason with, the notes say what the run's own history says about how well
+# that reasoning has been working.
+REASONING_PROTOCOL: str = """REASONING PROTOCOL - the loop scores predictions, not prose.
+
+PLAN (before your first tool call this round): one line naming the file or function you will change and the exact command, test or assertion that will prove it. A round with no falsifiable plan can only be narrated, not scored. Put it in this round's scores entry as `plan`.
+HYPOTHESIS (same entry, `hypothesis`): a falsifiable prediction - "if I <change>, <requirement> passes because <mechanism>". Name the mechanism. A prediction without one cannot be refuted, and a refutation is the only thing here that teaches you anything.
+PREDICTION CHECK (same entry, `prediction_check`): after TEST, set it to `hit`, `miss` or `partial` and name the belief the outcome confirmed or refuted. A miss is the most valuable line in the state: it marks the part of your model of this code that is wrong, and that is exactly what the next round has to change.
+CAUSE (same entry, `cause`): classify the PREVIOUS round's failure with exactly one label:
+  wrong_target - right idea, wrong file/function/entry point
+  wrong_mechanism - right place, but the code does not work the way you assumed
+  wrong_hypothesis - the prediction above was refuted: your model is wrong, not your code
+  incomplete_test - possibly right, but never exercised by a real command or test
+  env_issue - the tool, dependency or environment failed, not the logic
+  scope_misread - you solved a different problem than the requirement asked
+  unknown - none of the above; append the reason to the same field
+The cause decides what may NOT stay the same next round: wrong_target => move the target; wrong_mechanism => change the mechanism; wrong_hypothesis => re-read the code before editing; incomplete_test => run the test before touching code; env_issue => fix the environment first.
+The four fields are optional, but the loop measurably reasons better with them: `hypothesis` and `prediction_check` are what produce the PREDICTION RECORD, and `cause` is what turns "pick a different approach" into a decision instead of a guess.
+"""
+
 # ==============================================================================
 # Tool Declarations (the `tools` field of every llm_generate request)
 # ==============================================================================
@@ -313,6 +343,342 @@ TOOL_SCHEMA: List[Dict[str, Any]] = [
 ]
 
 
+# ==============================================================================
+# Reasoning-note text
+# ==============================================================================
+# Every string the model reads inside the REASONING NOTES block lives here, for the
+# same reason the rest of this file exists: the prompt is one artefact, and prose
+# split across a computation module and its caller is prose nobody can review in
+# one place. `jinx.reasoning` decides *whether* a note fires and with which
+# numbers; the wording of the note is assembled here and nowhere else.
+#
+# Each function takes already-computed data and returns the finished sentence, so
+# no model-facing string is ever built by string arithmetic in the caller. An
+# empty list or empty string means the note does not apply, which is how the
+# reasoning side decides whether to call at all.
+
+# The clause a truncated name list ends with. A list that reads as complete when
+# it was cut is a small lie told to a model deciding where to look.
+NOTE_MORE_ITEMS = " and %d more"
+
+
+def note_name_list(names: List[str], limit: int) -> str:
+    """Up to ``limit`` quoted names, saying so when the list was cut.
+
+    Used where the note is the only place the model learns the list is partial.
+    """
+    shown = ", ".join("'%s'" % name for name in names[:limit])
+    if len(names) > limit:
+        shown += NOTE_MORE_ITEMS % (len(names) - limit)
+    return shown
+
+
+def note_name_list_plain(names: List[str], limit: int) -> str:
+    """Up to ``limit`` quoted names, with no mention of what was left out.
+
+    Kept separate from ``note_name_list`` because the notes that use this one
+    already name a count or a bound in the same sentence, so announcing the cut
+    would double-count; the behaviour is preserved rather than unified.
+    """
+    return ", ".join("'%s'" % name for name in names[:limit])
+
+
+def note_calibration(hit: int, miss: int, partial: int, checked: int, rate: int) -> str:
+    """How well the model's own predictions about this code have held."""
+    note = (
+        "PREDICTION RECORD: %d hit, %d miss, %d partial across %d scored round(s) "
+        "(%d%% of the predictions you made about this code held)."
+        % (hit, miss, partial, checked, rate)
+    )
+    if miss > hit:
+        return note + (
+            " More were refuted than confirmed, so the model you are carrying into"
+            " this round is the thing under test: re-read the real implementation"
+            " of the path you are about to change instead of reasoning about it"
+            " from memory, and make this round's hypothesis about something you"
+            " have just observed rather than something you expect."
+        )
+    return note + (
+        " The mechanism named in your latest hypothesis is worth extending,"
+        " so keep that reasoning and widen its scope rather than restarting"
+        " from a new idea."
+    )
+
+
+def note_deadlock_risk(items: List[Tuple[str, int]]) -> str:
+    """The one cluster about to abort the run, named by requirement."""
+    body = "; ".join(
+        "requirement '%s' has now failed under %d structurally different"
+        " approaches, and one more distinct approach on it aborts the run"
+        " as a deadlock, so change the CATEGORY of approach for that"
+        " requirement now instead of reworking the details of the last one"
+        % (req, clusters)
+        for req, clusters in items
+    )
+    return "DEADLOCK RISK: " + body + "."
+
+
+def note_repeated_cause(rounds_text: str, label: str, repeats: int) -> str:
+    """Two consecutive rounds that failed the same way under different names."""
+    note = "REPEATED CAUSE: rounds %s both failed with cause '%s'" % (rounds_text, label)
+    if repeats >= 3:
+        note += ", which is %d rounds running" % repeats
+    return note + (
+        ". The class of mistake did not change, so rewording the approach is not"
+        " a new strategy: act on the constraint that label implies, or correct"
+        " the label if it was misclassified."
+    )
+
+
+def note_regression(parts: List[str]) -> str:
+    """Work an earlier round had already achieved and this one lost."""
+    return (
+        "REGRESSION: %s. Nothing else in the loop will notice, because check_exit"
+        " reads only all_pass of the latest round: restore what was lost before"
+        " starting new work." % "; ".join(parts)
+    )
+
+
+def regression_part_broken(named: str) -> str:
+    """A requirement that was true earlier and is false now."""
+    return "%s passed in an earlier round and is failing in your latest entry" % named
+
+
+def regression_part_count(latest: int, best: int) -> str:
+    """A lower pass count on the same requirement set."""
+    return (
+        "your latest round scored %d requirements against a best of %d"
+        " on the same requirement set" % (latest, best)
+    )
+
+
+def note_attribution(items: List[Tuple[str, int, str]]) -> str:
+    """Where the approach graph and the approach sentence disagree.
+
+    ``kind`` is "one_cluster" when the graph is coarser than the prose and
+    "many_clusters" when it is finer.
+    """
+    parts = []
+    for req, count, kind in items:
+        if kind == "one_cluster":
+            parts.append(
+                "requirement '%s' has %d differently worded attempts but your"
+                " approach graphs put all of them in one cluster, so check_deadlock"
+                " cannot see the later attempts as new approaches and its abort will"
+                " not fire" % (req, count)
+            )
+        else:
+            parts.append(
+                "requirement '%s' has %d structurally distinct approach graphs while"
+                " your approach sentences describe a single attempt, so the graphs"
+                " claim a variety of approaches that the text does not support and"
+                " the cluster count is counting rewrites of one idea" % (req, count)
+            )
+    return "APPROACH ATTRIBUTION: " + "; ".join(parts) + "."
+
+
+def note_requirement_keys(dropped: str, flickering: str) -> str:
+    """Requirement keys that were being measured and then were not."""
+    parts = [
+        "%s was scored in earlier rounds and is missing from your latest entry, so"
+        " its earlier passes no longer count toward exit and its earlier failures"
+        " no longer feed the deadlock check" % dropped
+    ]
+    if flickering:
+        parts.append(
+            "%s also flipped between pass and fail while it was being measured, so"
+            " one requirement's history is split across two incompatible records"
+            % flickering
+        )
+    return (
+        "REQUIREMENT KEYS DROPPED: %s. Either keep measuring them under one"
+        " spelling, or retire them explicitly in the state block rather than"
+        " letting them fall out." % "; ".join(parts)
+    )
+
+
+# The four conditions check_exit applies, phrased as what is missing rather than
+# as a rule, because the plateau rule appears in no prompt and a run refused for
+# improving would otherwise be refused with no explanation.
+def exit_blocker_min_rounds(min_rounds: int, rnd: int) -> str:
+    return (
+        "the loop runs at least %d rounds before exit is considered and this is round %d"
+        % (min_rounds, rnd)
+    )
+
+
+def exit_blocker_evidence(count: int) -> str:
+    return (
+        "exit needs at least two scored rounds of evidence and the history holds %d"
+        % count
+    )
+
+
+def exit_blocker_not_all_pass() -> str:
+    return "your latest round is not all_pass"
+
+
+def exit_blocker_plateau(last3: int, prior_best: int) -> str:
+    return (
+        "the last three rounds still beat every earlier round (%d"
+        " > %d requirements passed), and the loop only stops at a"
+        " plateau" % (last3, prior_best)
+    )
+
+
+def note_exit(blockers: List[str]) -> str:
+    """Why a run that looks finished will not be allowed to stop."""
+    return (
+        "EXIT NOT AVAILABLE: this round reads as finished, but check_exit will not"
+        " stop the run - %s. Work the first blocker rather than re-sending the"
+        " same state and expecting a different verdict." % "; ".join(blockers)
+    )
+
+
+# One stale citation. Three shapes, kept apart because they need different
+# corrections: a file that cannot be found, a line past the end of it, and a
+# symbol that has moved since the fact was written.
+def citation_unreadable(path_text: str) -> str:
+    return (
+        "a fact cites %s, which is not a file this loop can read under"
+        " the working directory, the package, or the system temp"
+        " directory" % path_text
+    )
+
+
+def citation_past_end(path_text: str, cited: int, length: int) -> str:
+    return "a fact cites %s:%d in a file of %d lines" % (path_text, cited, length)
+
+
+def citation_symbol_moved(path_text: str, cited: int, symbol: str, start: int) -> str:
+    return (
+        "a fact cites %s:%d for %s, which now starts at line %d"
+        % (path_text, cited, symbol, start)
+    )
+
+
+def note_citation(problems: List[str]) -> str:
+    return (
+        "STALE CITATION: %s. A file the loop cannot find is a claim it cannot check"
+        " rather than one it has disproved - name the path the way the file sits in"
+        " the tree, so the next round can settle it. The substance of a fact is"
+        " often still right, but a pointer the model has not checked is how a wrong"
+        " line number becomes load-bearing evidence; re-read the file and correct"
+        " the fact rather than reasoning from the citation."
+        % "; ".join(problems)
+    )
+
+
+# Where the plan probe looks. Named once, because a plan note that describes the
+# probe inaccurately sends the model looking for its file in a directory that
+# holds it.
+PLAN_PROBE_ROOTS = "the working directory, the package, or the system temp directory"
+
+
+def note_plan(named: str, all_pass: bool) -> str:
+    """A path the previous round's plan named that the loop cannot see."""
+    if all_pass:
+        return (
+            "PLAN NOT IN TREE: your last plan named %s, which is not under %s, and"
+            " that round scored every requirement as passing. If the pass depended"
+            " on that change, the change is not where this loop can see it - find out"
+            " what was actually written before treating the requirement as done."
+            % (named, PLAN_PROBE_ROOTS)
+        )
+    return (
+        "PLAN NOT IN TREE: your last plan named %s, which is not under %s, so what"
+        " that round changed to fix the failing requirements was somewhere this loop"
+        " cannot see, or was never written. Name a path this loop can check in the"
+        " plan." % (named, PLAN_PROBE_ROOTS)
+    )
+
+
+# The three claims a score entry makes about itself, and the ways they can
+# disagree. `plural` is passed in rather than derived from a count here, so the
+# grammar of the sentence is decided once, next to the sentence.
+def contradiction_non_bool(named: str, plural: bool) -> str:
+    return (
+        "the verdict%s for %s %s not true/false, and check_deadlock reads every"
+        " verdict by truthiness" % ("s" if plural else "", named,
+                                    "are" if plural else "is")
+    )
+
+
+def contradiction_pass_count(claimed: int, actual: int) -> str:
+    return "pass_count is %d but the requirements map holds %d true verdict(s)" % (
+        claimed, actual
+    )
+
+
+def contradiction_all_pass_true(named: str, plural: bool) -> str:
+    return "all_pass is true while %s %s false in the same entry" % (
+        named, "are" if plural else "is"
+    )
+
+
+def contradiction_all_pass_false(total: int) -> str:
+    return "all_pass is false while all %d requirement(s) in the same entry are true" % total
+
+
+def note_score_contradiction(problems: List[str]) -> str:
+    return (
+        "SCORE CONTRADICTION: a score entry disagrees with itself, and the brakes"
+        " read the halves separately - check_exit decides whether the run may stop"
+        " from all_pass alone and builds its plateau rule from pass_count alone,"
+        " while check_deadlock reads the requirements map. All three cannot be"
+        " true at once: %s. Correct the entry before trusting either verdict."
+        % "; ".join(problems)
+    )
+
+
+def round_problem(round_number: Any, problem: str) -> str:
+    """One problem, attributed to the round whose entry holds it."""
+    return "round %s: %s" % (round_number, problem)
+
+
+# What a drifted mirror is no longer able to tell the model. Named per key so the
+# drift note says which advice is missing rather than that something is.
+MIRROR_LOST_LABELS: Dict[str, str] = {
+    "exit": "why the run cannot exit yet",
+    "similarity": (
+        "whether a requirement is close to a deadlock and whether the"
+        " approach graphs match the attempts they describe"
+    ),
+}
+
+
+def note_mirror_drift(keys: List[str]) -> str:
+    lost = [MIRROR_LOST_LABELS[key] for key in keys if key in MIRROR_LOST_LABELS]
+    return (
+        "MIRROR DRIFT: %s could not be reported, because the advisory computation"
+        " no longer matches the protected logic it describes and would be claiming"
+        " from a rule that has changed underneath it. Treat the rest of this block"
+        " as incomplete for this round." % ", ".join(lost)
+    )
+
+
+def assemble_notes(header: str, parts: List[str], max_chars: int) -> str:
+    """Joins the notes that fit the budget, in the order they were produced.
+
+    An over-budget note is dropped rather than truncated, so a late note can never
+    cost an urgent one its space, and an empty part never reaches the block: a
+    header with no body reads as a truncated message and spends tokens saying
+    nothing. The caller owns the order, because priority is a decision about what
+    the model should read first.
+    """
+    kept: List[str] = []
+    for part in parts:
+        if not part:
+            continue
+        projected = len(header) + 1 + sum(len(p) + 1 for p in kept) + len(part)
+        if projected > max_chars:
+            continue
+        kept.append(part)
+    if not kept:
+        return ""
+    return "%s\n%s" % (header, "\n".join(kept))
+
+
 def construct_round_prompt(
     rnd: int, min_rounds: int, state_dump: str, missing_state: bool = False,
     lessons_text: str = "",
@@ -334,6 +700,14 @@ def construct_round_prompt(
     warning_prefix = MISSING_STATE_WARNING if missing_state else ""
     round_label = f"ROUND {rnd} (at least {min_rounds} rounds required before exit is considered)"
     sections = [f"{warning_prefix}{round_label}\nCURRENT STATE:\n{state_dump}"]
+    notes = reasoning.render_notes(
+        state_dump, REASONING_NOTES_HEADER, min_rounds=min_rounds, rnd=rnd,
+    )
+    if notes:
+        # Only when there is a score history to reason about. Round 1 has none,
+        # and an empty note block would cost tokens without informing anything.
+        sections.append(notes)
+        sections.append(REASONING_PROTOCOL)
     if lessons_text:
         sections.append(lessons_text)
     return "\n\n".join(sections)
