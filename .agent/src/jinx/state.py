@@ -22,6 +22,8 @@ from typing import Any, Dict, List, Optional, Union
 import yaml
 from pydantic import BaseModel, Field
 
+from . import prompts
+
 logger = logging.getLogger("jinx.state")
 
 AGENT_DIR: Path = Path(__file__).resolve().parent.parent.parent
@@ -381,11 +383,7 @@ def merge_state(
         logger.error("State validation failed: %s. Rejecting update.", e)
         if diagnostics is not None:
             diagnostics.append(
-                "Your previous state block was REJECTED and discarded; the state on "
-                "disk is unchanged. Reason: %s: %s. Re-send a corrected block. Common "
-                "causes: an unquoted ':' or '#' inside a scalar value, a tab used for "
-                "indentation, or a key nested one level too deep. Because the block "
-                "was rejected, your exit_ready/deadlock flags were NOT honoured."
+                prompts.STATE_BLOCK_REJECTED
                 % (type(e).__name__, str(e).splitlines()[0][:200])
             )
         if outcome is not None:
@@ -420,9 +418,7 @@ def merge_state(
             sent = len(validated_dict["scores"] or [])
             if stored > sent:
                 diagnostics.append(
-                    "State accepted. Score history merged by round: %d entr%s on "
-                    "disk, %d sent this round — %d preserved from earlier rounds. "
-                    "You may send only the current round's entry from now on."
+                    prompts.STATE_SCORES_MERGED
                     % (stored, "y" if stored == 1 else "ies", sent, stored - sent)
                 )
 

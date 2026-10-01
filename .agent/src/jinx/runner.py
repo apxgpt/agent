@@ -402,6 +402,21 @@ def clean_up_ipc_files() -> None:
         p.unlink(missing_ok=True)
 
 
+# AGENT_DIR is derived from this module's location, not from the CWD, so the IPC
+# paths above are shared by *every* process that imports jinx. An editor, a
+# linter or a test runner that merely imports the package and then receives
+# Ctrl+C would delete a live session's request, response and run state - the
+# session it has no part in, from whatever directory it happens to be in. Only
+# the process that actually wrote those files may remove them.
+_IPC_OWNER = False
+
+
+def _claim_ipc_files() -> None:
+    """Record that this process created the IPC files and may clean them up."""
+    global _IPC_OWNER
+    _IPC_OWNER = True
+
+
 # Register cleanup handlers to ensure IPC files are removed on exit/signals.
 def _signal_cleanup(signum=None, frame=None) -> None:
     try:
@@ -422,10 +437,23 @@ def _signal_cleanup(signum=None, frame=None) -> None:
         except Exception:
             pass
     else:
-        try:
-            clean_up_ipc_files()
-        except Exception:
-            pass
+        if _IPC_OWNER:
+            try:
+                clean_up_ipc_files()
+            except Exception:
+                pass
+        else:
+            # Not a failure: a bystander process (editor, linter, test runner)
+            # was interrupted, and the session files belong to a run that is
+            # still going. Deleting them here would destroy that run's only
+            # record of the current round.
+            try:
+                logger.warning(
+                    "Signal %s received in a process that does not own the JINX "
+                    "IPC files; leaving %s intact.", signum, AGENT_DIR,
+                )
+            except Exception:
+                pass
     # Use os._exit to avoid sys.exit raising SystemExit inside a signal handler,
     # which can cause recursion if the handler itself was invoked during cleanup.
     try:
@@ -444,7 +472,10 @@ def _install_signal_handlers() -> None:
     disarmed Ctrl+C in every one of those processes and removed files they had
     no business removing; the agent is supposed to be stopped, not to vanish.
     """
-    for sig in ("SIGINT", "SIGTERM", "SIGHUP"):
+    # SIGBREAK is the one Windows actually adds (Ctrl+Break); SIGHUP is the one
+    # POSIX hosts have and Windows lacks. Listing both keeps each platform's
+    # interrupt path registered instead of relying on getattr to fail.
+    for sig in ("SIGINT", "SIGTERM", "SIGBREAK", "SIGHUP"):
         try:
             signum = getattr(signal, sig)
             signal.signal(signum, _signal_cleanup)
@@ -655,7 +686,7 @@ def _elide_tail(tail: str, max_lines: int = DEFAULT_RAW_TAIL_LINES) -> str:
     head = max(1, max_lines // 2)
     tail_lines = max(1, max_lines - head)
     dropped = len(lines) - head - tail_lines
-    middle = ["... %d line(s) elided by JINX to fit the budget ..." % dropped]
+    middle = [prompts.HISTORY_ELISION_MARKER % dropped]
     return "\n".join(lines[:head] + middle + lines[-tail_lines:])
 
 
@@ -962,6 +993,14 @@ def write_llm_request(
 def run_file_ipc(task: Optional[str], min_override: Optional[int]) -> None:
     """Orchestrates JINX loop using a stateless File-based IPC protocol."""
     _install_signal_handlers()
+    # Claimed here rather than at each write site: the IPC files are written by
+    # four different helpers (write_llm_request, _write_tool_request,
+    # _write_llm_request_no_tools and _handle_tool_response), and a run that
+    # goes through the tool-call or no-tools paths would otherwise create the
+    # files without owning them, leaving nothing to clean up on Ctrl+C. Starting
+    # a file-IPC session is exactly what makes this process the owner, and it is
+    # the one thing a bystander process never does.
+    _claim_ipc_files()
     is_resuming = RUN_STATE_PATH.exists() and not task
 
     if not is_resuming:

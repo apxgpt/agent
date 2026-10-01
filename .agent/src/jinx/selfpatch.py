@@ -556,10 +556,4 @@ def guard_tool_call(path: str, content: str) -> Optional[str]:
     violations = is_protected_change(path, content)
     if not violations:
         return None
-    return (
-        "Self-patch refused: '%s' defines protected JINX logic (%s). These are "
-        "the mechanisms that detect a broken framework, so the agent may not "
-        "rewrite them. Change non-brake code in the same file instead, or have "
-        "a human set JINX_ALLOW_PROTECTED_EDITS=1 to override deliberately."
-        % (Path(path).name, "; ".join(violations))
-    )
+    return prompts.PROTECTED_EDIT_REFUSAL % (Path(path).name, "; ".join(violations))

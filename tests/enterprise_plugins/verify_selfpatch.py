@@ -128,8 +128,48 @@ class VerifySelfpatchPhase(VerificationPhase):
 
         # ==============================================================================
         # <CUSTOM_CODE_START>
-        # Add custom assertions and execution tests below. They will be preserved.
-        pass
+        # Behavioural verification for the self-patch guard. The generated
+        # checks above are hasattr-only.
+        def _assert(label, ok):
+            suite.print_badge(label, bool(ok))
+            return bool(ok)
+
+        # guard_tool_call resolves the path against the CWD and only then asks
+        # whether it is inside SRC_DIR. That ordering is load-bearing and easy to
+        # misread as a filename check, so both halves are pinned: the real brake
+        # file is refused, and a same-named file elsewhere is not.
+        _real_runner = str(target_module.SRC_DIR / "jinx" / "runner.py")
+        _brake_content = "def check_exit(a, b, c):\n    return True\n"
+
+        _reason = target_module.guard_tool_call(_real_runner, _brake_content)
+        if not _assert(
+            "guard: rewriting check_exit in the real runner.py is refused",
+            bool(_reason) and "refused" in _reason.lower(),
+        ):
+            success = False
+
+        for _label, _content in (
+            ("check_deadlock", "def check_deadlock(a, b, c):\n    return True\n"),
+            ("min_rounds brake", "def check_exit(scores, min_rounds, rnd):\n    return True\n"),
+        ):
+            _r = target_module.guard_tool_call(_real_runner, _content)
+            if not _assert("guard: %s removal is refused" % _label, bool(_r)):
+                success = False
+
+        # A file named runner.py that is not the framework's own must stay
+        # writable, otherwise the guard blocks unrelated work.
+        if not _assert(
+            "guard: a same-named file outside SRC_DIR is not refused",
+            target_module.guard_tool_call("runner.py", _brake_content) is None,
+        ):
+            success = False
+
+        # An edit to non-brake code in the same file is allowed.
+        if not _assert(
+            "guard: non-brake code in runner.py stays writable",
+            target_module.guard_tool_call(_real_runner, "# harmless comment\n") is None,
+        ):
+            success = False
         # <CUSTOM_CODE_END>
         # ==============================================================================
 

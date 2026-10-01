@@ -51,6 +51,11 @@ import yaml
 
 from .state import AGENT_DIR, atomic_write_yaml
 
+# LEARNED_RULES_HEADER lives in prompts.py with every other model-facing phrase.
+# Re-exported here because its length is charged against LESSONS_BUDGET_CHARS, so
+# the budget boundary has to be computable where the budget is enforced.
+from .prompts import LEARNED_RULES_HEADER
+
 logger = logging.getLogger("jinx.learning")
 
 # The ledger deliberately lives outside JINX.yaml: that file is reset when a new
@@ -72,12 +77,7 @@ LESSONS_BUDGET_CHARS: int = int(os.environ.get("JINX_LESSONS_BUDGET_CHARS", "120
 
 VALID_KINDS = ("rule", "skill", "antipattern")
 
-# Header of the injected block. A module constant because its length is charged
-# against LESSONS_BUDGET_CHARS, so the budget boundary has to be computable.
-LEARNED_RULES_HEADER = (
-    "LEARNED RULES (durable, carried over from earlier sessions; "
-    "verified rules float up, rules that kept failing are no longer shown):"
-)
+# Header of the injected block comes from prompts.py (see the import above).
 
 
 def _normalize(text: str) -> str:
