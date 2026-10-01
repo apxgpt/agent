@@ -78,8 +78,39 @@ class VerifyLearningPhase(VerificationPhase):
 
         # ==============================================================================
         # <CUSTOM_CODE_START>
-        # Add custom assertions and execution tests below. They will be preserved.
-        pass
+        # Behavioural verification for the lesson ledger. The generated checks
+        # above only prove the module's names exist.
+        def _assert(label, ok):
+            suite.print_badge(label, bool(ok))
+            return bool(ok)
+
+        # The 300-character cap is a storage bound applied in
+        # normalize_lesson_text. Nothing asserted it: render_lessons enforces
+        # the aggregate prompt budget by dropping whole entries, so deleting
+        # the per-rule cap leaves every other check green while letting an
+        # unbounded rule into the ledger.
+        _stored = target_module.normalize_lesson_text("word " * 5000)
+        if not _assert(
+            "normalize_lesson_text: an overlong rule is capped at 300 chars",
+            isinstance(_stored, str) and len(_stored) == 300,
+        ):
+            success = False
+        if not _assert(
+            "normalize_lesson_text: the cap truncates rather than rejecting",
+            isinstance(_stored, str) and _stored.startswith("word word"),
+        ):
+            success = False
+        if not _assert(
+            "normalize_lesson_text: a short rule is left untouched",
+            target_module.normalize_lesson_text("  a   b  ") == "a b",
+        ):
+            success = False
+        if not _assert(
+            "normalize_lesson_text: unusable input is dropped, not stored",
+            target_module.normalize_lesson_text(None) is None
+            and target_module.normalize_lesson_text("   ") is None,
+        ):
+            success = False
         # <CUSTOM_CODE_END>
         # ==============================================================================
 

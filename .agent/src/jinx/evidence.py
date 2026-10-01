@@ -16,6 +16,8 @@ from __future__ import annotations
 import re
 from typing import Dict, List, Optional, Tuple
 
+from . import prompts
+
 SCHEMA: str = "jinx.evidence/1"
 
 # "FAILED tests/test_x.py::test_y - AssertionError: expected >= 0.7"
@@ -178,38 +180,36 @@ def render_digest(
     if not groups:
         return ""
 
-    lines: List[str] = ["TEST EVIDENCE (grouped by cause, not by test):"]
+    lines: List[str] = [prompts.EVIDENCE_HEADER]
     failed = counts.get("failed", 0)
     passed = counts.get("passed")
     if failed or passed is not None:
-        summary = "%d failed" % failed
+        summary = prompts.EVIDENCE_FAILED_COUNT % failed
         if passed is not None:
-            summary += ", %d passed" % passed
+            summary += prompts.EVIDENCE_PASSED_COUNT % passed
         if counts.get("skipped"):
-            summary += ", %d skipped" % counts["skipped"]
+            summary += prompts.EVIDENCE_SKIPPED_COUNT % counts["skipped"]
         lines.append(summary)
-    lines.append("%d distinct cause(s):" % len(groups))
+    lines.append(prompts.EVIDENCE_CAUSE_COUNT % len(groups))
 
     for group in groups[:max_groups]:
         nodeids = ", ".join(str(e) for e in group["examples"])  # type: ignore[index]
         # The group key is masked and lossy on purpose, so the row shows the
         # first original reason verbatim: the model gets a coarse grouping and a
         # concrete message to act on, rather than a fingerprint it must guess at.
-        line = "- %s | %s | %d test(s): %s" % (
+        line = prompts.EVIDENCE_GROUP_LINE % (
             group["file"], group.get("sample") or group["reason"],
             group["count"], nodeids,
         )
         if int(group["count"]) > len(group["examples"]):  # type: ignore[arg-type]
-            line += ", ..."
+            line += prompts.EVIDENCE_MORE_EXAMPLES
         lines.append(line)
     if len(groups) > max_groups:
-        lines.append("- ...and %d more cause(s), each above the budget" % (len(groups) - max_groups))
+        lines.append(prompts.EVIDENCE_MORE_CAUSES % (len(groups) - max_groups))
 
     if report.get("undercounted"):
         lines.append(
-            "WARNING: the run reported %s failure(s) but only %s could be parsed "
-            "from the captured output; the tail was truncated, so causes listed "
-            "here are partial." % (
+            prompts.EVIDENCE_UNDERCOUNTED % (
                 counts.get("failed"), report.get("parsed_failures"),
             )
         )
@@ -234,8 +234,8 @@ def evidence_from_check(
         return digest
     if not check.get("ok"):
         if tail:
-            return "TEST EVIDENCE: %s failed but produced no parseable failure line.\n%s" % (
+            return prompts.EVIDENCE_UNPARSED_WITH_TAIL % (
                 check.get("name"), tail
             )
-        return "TEST EVIDENCE: %s failed but produced no parseable failure line." % check.get("name")
+        return prompts.EVIDENCE_UNPARSED % check.get("name")
     return None

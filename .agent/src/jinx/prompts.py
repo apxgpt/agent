@@ -250,8 +250,71 @@ INVALID_TOOL_BLOCK_INPUT_MSG: str = "Error: Malformed tool_use block (input must
 
 FILE_SLICE_FAILURE_MSG: str = "Error: Failed to slice file content: %s"
 
+# The test-evidence block. `jinx.evidence` decides which failures exist and how
+# they group by cause; every phrase the model reads in the digest is assembled
+# here, so the wording can be reviewed in one place.
+EVIDENCE_HEADER: str = "TEST EVIDENCE (grouped by cause, not by test):"
+EVIDENCE_FAILED_COUNT: str = "%d failed"
+EVIDENCE_PASSED_COUNT: str = ", %d passed"
+EVIDENCE_SKIPPED_COUNT: str = ", %d skipped"
+EVIDENCE_CAUSE_COUNT: str = "%d distinct cause(s):"
+EVIDENCE_GROUP_LINE: str = "- %s | %s | %d test(s): %s"
+EVIDENCE_MORE_EXAMPLES: str = ", ..."
+EVIDENCE_MORE_CAUSES: str = "- ...and %d more cause(s), each above the budget"
+EVIDENCE_UNDERCOUNTED: str = (
+    "WARNING: the run reported %s failure(s) but only %s could be parsed "
+    "from the captured output; the tail was truncated, so causes listed "
+    "here are partial."
+)
+EVIDENCE_UNPARSED_WITH_TAIL: str = (
+    "TEST EVIDENCE: %s failed but produced no parseable failure line.\n%s"
+)
+EVIDENCE_UNPARSED: str = (
+    "TEST EVIDENCE: %s failed but produced no parseable failure line."
+)
+
+# Marker spliced into an elided history so the model sees a gap it cannot read,
+# rather than two halves of a transcript that look consecutive.
+HISTORY_ELISION_MARKER: str = "... %d line(s) elided by JINX to fit the budget ..."
+
+# Sent back when the state block was valid but carried fewer score entries than
+# the loop already stored, which the merge resolves in favour of what is on disk.
+STATE_SCORES_MERGED: str = (
+    "State accepted. Score history merged by round: %d entr%s on "
+    "disk, %d sent this round — %d preserved from earlier rounds. "
+    "You may send only the current round's entry from now on."
+)
+
+# Refusal returned when a tool call tries to rewrite brake logic. Kept apart from
+# PROTECTED_SYMBOL_REFUSAL, which is the message for a change that was already
+# written and then rolled back: one is a refusal, the other an explanation.
+PROTECTED_EDIT_REFUSAL: str = (
+    "Self-patch refused: '%s' defines protected JINX logic (%s). These are "
+    "the mechanisms that detect a broken framework, so the agent may not "
+    "rewrite them. Change non-brake code in the same file instead, or have "
+    "a human set JINX_ALLOW_PROTECTED_EDITS=1 to override deliberately."
+)
+
+# Sent back when a submitted state block fails validation. Distinct from
+# MISSING_STATE_WARNING, which covers a block that was never sent at all.
+STATE_BLOCK_REJECTED: str = (
+    "Your previous state block was REJECTED and discarded; the state on "
+    "disk is unchanged. Reason: %s: %s. Re-send a corrected block. Common "
+    "causes: an unquoted ':' or '#' inside a scalar value, a tab used for "
+    "indentation, or a key nested one level too deep. Because the block "
+    "was rejected, your exit_ready/deadlock flags were NOT honoured."
+)
+
 REASONING_NOTES_HEADER: str = (
     "REASONING NOTES (computed from the score history above, not from this round):"
+)
+
+
+# Learned rules header used when injecting durable lessons into the prompt. Moved
+# here so every model-facing phrase lives in prompts.py.
+LEARNED_RULES_HEADER: str = (
+    "LEARNED RULES (durable, carried over from earlier sessions; "
+    "verified rules float up, rules that kept failing are no longer shown):"
 )
 
 # Why the four optional fields below exist. The loop protocol already demands
