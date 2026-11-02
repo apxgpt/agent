@@ -152,53 +152,66 @@ def self_patch_preflight():
     try:
         if not mod.BASELINE_DIR.exists():
             return
-        changed = mod.baseline_changed()
-        if not changed:
+        if not mod.baseline_changed():
             # Nothing was touched, so the baseline is still the right reference
             # for the rest of the run. Clearing it here would disarm the gate
             # before the first tool call ever happened.
             return
-        # Same protection re-check the runner does: `file_write` is not the only
-        # way into the source tree, and a brake weakened via `bash_exec` would
-        # otherwise be adopted here as the new baseline.
-        violations = mod.protection_violations()
-        if violations:
+        # Several JINX processes can start at once (one per session and transition), and
+        # only one of them may verify and restore: a baseline that two processes rewrite
+        # together can be left half written. The lock goes away with its holder.
+        with mod.gate_lock() as held:
+            if not held:
+                print("[JINX SELF-PATCH] Another process is running the gate; skipping the preflight",
+                      file=sys.stderr)
+                return
+            # Looked at again under the lock: the process that held it may just have
+            # verified (and adopted) or reverted exactly this change.
+            changed = mod.baseline_changed()
+            if not changed:
+                return
+            # Same protection re-check the runner does: `file_write` is not the only
+            # way into the source tree, and a brake weakened via `bash_exec` would
+            # otherwise be adopted here as the new baseline.
+            violations = mod.protection_violations()
+            if violations:
+                restored = mod.restore_baseline()
+                detail = "; ".join(
+                    "%s: %s" % (name, ", ".join(reasons))
+                    for name, reasons in sorted(violations.items())
+                )
+                _record_feedback(
+                    "[JINX SELF-PATCH REFUSED] The previous round changed protected "
+                    "brake logic (%s). It was rolled back automatically and NOT "
+                    "verified: these functions are what stop a self-patch from "
+                    "removing its own safety checks, so no test result can justify "
+                    "changing them. Improve something else, or ask a human." % detail
+                )
+                print(
+                    "[JINX SELF-PATCH] Refused and rolled back: %s"
+                    % ", ".join(restored or sorted(violations)),
+                    file=sys.stderr,
+                )
+                return
+            # The editor CLI owns functional testing. The self-patch gate retains
+            # only fast checks (compile, then import), so an edit that cannot be
+            # loaded never becomes the next baseline.
+            result = mod.verify()
+            if result["ok"]:
+                print("[JINX SELF-PATCH] Check passed (%s): %s" % (result["summary"], ", ".join(changed)),
+                      file=sys.stderr)
+                # The edit is structurally valid, so adopt it as the next
+                # reference instead of checking the same diff on every process.
+                mod.capture_baseline()
+                return
             restored = mod.restore_baseline()
-            detail = "; ".join(
-                "%s: %s" % (name, ", ".join(reasons))
-                for name, reasons in sorted(violations.items())
-            )
-            _record_feedback(
-                "[JINX SELF-PATCH REFUSED] The previous round changed protected "
-                "brake logic (%s). It was rolled back automatically and NOT "
-                "verified: these functions are what stop a self-patch from "
-                "removing its own safety checks, so no test result can justify "
-                "changing them. Improve something else, or ask a human." % detail
-            )
-            print(
-                "[JINX SELF-PATCH] Refused and rolled back: %s"
-                % ", ".join(restored or sorted(violations)),
-                file=sys.stderr,
-            )
-            return
-        # Same rule as the runner: the suite that judges the patch is itself part
-        # of what the patch could have edited, so it is put back before it runs.
-        mod.restore_baseline(only=mod.REPO_PREFIX)
-        result = mod.verify(src_path.parent.parent)
-        if result["ok"]:
-            print("[JINX SELF-PATCH] Verified: %s" % ", ".join(changed), file=sys.stderr)
-            # The edit passed, so adopt it as the new reference instead of
-            # re-verifying the same diff on every subsequent process.
-            mod.capture_baseline()
-            return
-        restored = mod.restore_baseline()
     except Exception as e:
         print("[JINX SELF-PATCH] Preflight failed: %s" % e, file=sys.stderr)
         return
 
     message = (
         "[JINX SELF-PATCH REVERTED] The previous round edited JINX's own source "
-        "(%s) and broke it, so the framework could not even start. The change was "
+        "(%s) and failed the compile/import check, so it could not be accepted. The change was "
         "rolled back automatically and the run continues (%s).\n%s"
         % (
             ", ".join(changed),
@@ -210,23 +223,50 @@ def self_patch_preflight():
     _record_feedback(message)
 
 
-def _record_feedback(message):
-    """Hands a preflight verdict to the next prompt via the run state.
+# A preflight verdict waits in this folder (next to the run state of the run it is for), one small
+# file each, until that run reads and removes it (runner._take_notices). At most MAX_NOTICES wait at
+# once, so a run that never comes back for them cannot collect them for ever.
+NOTICES_DIR = "notices"
+MAX_NOTICES = 8
 
-    pyyaml is an external dependency, not part of the package, so this still
-    works when the source tree itself is too broken to import JINX.
+
+def _record_feedback(message):
+    """Leaves a preflight verdict for the next prompt of every run that is in progress.
+
+    The verdict goes into a file of its own and never into a run state: the process that notices
+    the damage does not own the other sessions' run states, and rewriting a file whose owner is
+    about to rewrite it too silently drops one of the two writes. Every verdict gets a name of its
+    own, so two preflights cannot overwrite each other either.
+
+    pyyaml is an external dependency, not part of the package, so this still works when the source
+    tree itself is too broken to import JINX.
     """
     try:
+        import os
+        import time
         import yaml
-        run_state_path = Path(__file__).resolve().parent / "jinx_run_state.yaml"
-        if run_state_path.is_file():
-            data = yaml.safe_load(run_state_path.read_text(encoding="utf-8")) or {}
-            if isinstance(data, dict):
-                data["self_patch_feedback"] = message
-                run_state_path.write_text(
-                    yaml.safe_dump(data, allow_unicode=True, sort_keys=False),
-                    encoding="utf-8",
-                )
+        agent_dir = Path(__file__).resolve().parent
+        # The single shared run, and every JINX session's: the process that notices the damage is
+        # not necessarily the one whose round caused it, and the message is true for all of them
+        # (the source they all run was rolled back).
+        runs = [agent_dir / "jinx_run_state.yaml"]
+        ipc = Path(os.environ.get("JINX_IPC_DIR") or (agent_dir / "ipc"))
+        try:
+            runs.extend(sorted((ipc / "sessions").glob("*/jinx_run_state.yaml")))
+        except OSError:
+            pass
+        body = yaml.safe_dump({"message": message}, allow_unicode=True, sort_keys=False)
+        for run_state_path in runs:
+            if not run_state_path.is_file():
+                continue
+            folder = run_state_path.parent / NOTICES_DIR
+            folder.mkdir(exist_ok=True)
+            name = "%019d-%d.yaml" % (time.time_ns(), os.getpid())
+            tmp = folder / (name + ".tmp")
+            tmp.write_text(body, encoding="utf-8")
+            os.replace(tmp, folder / name)
+            for old in sorted(folder.glob("*.yaml"))[:-MAX_NOTICES]:
+                old.unlink(missing_ok=True)
     except Exception as e:
         print("[JINX SELF-PATCH] Could not record feedback: %s" % e, file=sys.stderr)
 
@@ -248,6 +288,16 @@ def bootstrap_dependencies():
 
 # Check and install dependencies before importing JINX package modules
 bootstrap_dependencies()
+
+# Looking at the other sessions (--peek) changes nothing, so it must not run the self-patch preflight (which
+# could judge another session's edit in progress) and does not need the runner either. Collecting the rounds
+# into one .mbox (--export) reads the round files and writes nothing but its own output (.agent/export/).
+if "--peek" in sys.argv[1:]:
+    from jinx.team import peek_main
+    sys.exit(peek_main(sys.argv[1:], src_path.parent))
+if "--export" in sys.argv[1:]:
+    from jinx.export import export_main
+    sys.exit(export_main(sys.argv[1:], src_path.parent))
 
 # Revert a broken self-edit before importing the package, not after.
 self_patch_preflight()
